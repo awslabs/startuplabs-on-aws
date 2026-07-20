@@ -1,0 +1,46 @@
+# Web framework
+fastapi==0.115.12
+uvicorn==0.34.2
+pydantic==2.10.6
+
+# LangChain / LangGraph stack (Bedrock Claude via ChatBedrock)
+langchain-aws>=0.2.15
+# Langfuse's `langfuse.langchain` callback handler imports the top-level
+# `langchain` package at module import time. We don't use `langchain` directly
+# in the agent, but Langfuse requires it. Pinned to the 0.3.x line to stay
+# compatible with langchain-core 0.3.x.
+langchain>=0.3.0,<0.4
+langgraph==0.2.62
+langchain-core>=0.3.29,<0.4
+
+# AWS SDK + LangSmith client (already required transitively, pinned for clarity)
+boto3
+langsmith
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry instrumentation (shared by AgentCore Observability and Langfuse)
+#
+# IMPORTANT: aws-opentelemetry-distro (ADOT) pins a specific, mutually-compatible
+# set of core OpenTelemetry packages (api / sdk / exporters / propagators).
+# Do NOT independently floor-pin opentelemetry-api/sdk/exporter here — adding our
+# own ">=" floors lets pip pick newer core packages that ADOT forbids, which
+# makes the resolve impossible (ResolutionImpossible at image build time). We let
+# the distro anchor the core OTel versions and only list the extra
+# instrumentations the app actually imports, so their versions resolve against
+# ADOT's core.
+# ---------------------------------------------------------------------------
+# AWS OTEL Distro — applies SigV4 to AWS OTLP endpoints automatically and brings
+# a coherent opentelemetry-api/sdk/exporter/propagator set (incl. the X-Ray
+# propagator and OTLP HTTP exporter the pod uses via env vars).
+aws-opentelemetry-distro>=0.10.0
+# Instrumentations the app imports directly (versions resolve against ADOT core).
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-requests
+# Traceloop instrumentation for LangChain/LangGraph. Required for LangGraph
+# sessions to appear in the AgentCore Observability GenAI console.
+opentelemetry-instrumentation-langchain>=0.48.0
+
+# ---------------------------------------------------------------------------
+# Langfuse — LLM observability platform with session replay and LLM-as-judge
+# ---------------------------------------------------------------------------
+langfuse>=3.0.0
