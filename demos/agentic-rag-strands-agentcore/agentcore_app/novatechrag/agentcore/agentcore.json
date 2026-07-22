@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "novatechrag",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "novatechrag"
+  },
+  "runtimes": [
+    {
+      "name": "novatechragagent",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/novatechragagent/",
+      "runtimeVersion": "PYTHON_3_12",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "envVars": [
+        { "name": "KNOWLEDGE_BASE_ID", "value": "REPLACE_WITH_YOUR_KB_ID" },
+        { "name": "KNOWLEDGE_BASE_REGION", "value": "us-east-1" },
+        { "name": "INFERENCE_MODEL_ID", "value": "mistral.mistral-large-3-675b-instruct" },
+        { "name": "AGENTCORE_MEMORY_ID", "value": "REPLACE_WITH_YOUR_MEMORY_ID" }
+      ]
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "payments": []
+}
