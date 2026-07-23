@@ -1,0 +1,13 @@
+# CODEOWNERS
+# Each line is a file pattern followed by one or more owners.
+# Owners are automatically requested for review when someone opens a PR
+# that modifies the matching files.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# CI/CD workflows and security configuration - restricted to admins
+.github/workflows/      @awslabs/startuplabs-on-aws
+.ash/                   @awslabs/startuplabs-on-aws
+.pre-commit-config.yaml @awslabs/startuplabs-on-aws
+
+# Default owners for everything else
+*                       @awslabs/startuplabs-on-aws
