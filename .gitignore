@@ -45,3 +45,14 @@ terraform.rc
 *kube-config.yaml
 
 .ash/ash_output/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+.env
