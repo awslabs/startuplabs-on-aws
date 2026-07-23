@@ -42,9 +42,9 @@ def main():
                 print(f"  ✓ Reusing existing memory: {mem_id}")
                 _print_result(mem_id)
                 return
-    except Exception:
+    except Exception as e:
         # list_memories signature/behavior can vary; fall through to create.
-        pass
+        print(f"  Note: could not list existing memories ({e}); creating a new one.")
 
     print(f"Creating memory '{MEMORY_NAME}' with long-term strategies...")
     print("  (this waits for the resource to become ACTIVE — ~1-2 min)")

@@ -148,8 +148,8 @@ def create_opensearch_collection(aoss_client, account_id):
             type="encryption",
             policy=encryption_policy,
         )
-    except Exception:
-        pass  # Policy may already exist
+    except Exception as e:
+        print(f"  Note: encryption policy not created (may already exist): {e}")
 
     # Network policy.
     #
@@ -193,8 +193,8 @@ def create_opensearch_collection(aoss_client, account_id):
             type="network",
             policy=network_policy,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  Note: network policy not created (may already exist): {e}")
 
     # Create data access policy
     data_access_policy = json.dumps(
@@ -238,8 +238,8 @@ def create_opensearch_collection(aoss_client, account_id):
             type="data",
             policy=data_access_policy,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  Note: data access policy not created (may already exist): {e}")
 
     # Create the collection
     try:

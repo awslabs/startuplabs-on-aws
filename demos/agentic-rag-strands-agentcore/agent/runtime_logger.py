@@ -69,16 +69,16 @@ def _invoke_remote(question: str, session_id: str) -> None:
         body = response.get("response")
         if body is not None:
             try:
-                for _ in body.iter_chunks():
-                    pass
+                for _chunk in body.iter_chunks():
+                    continue  # draining the stream to completion
             except AttributeError:
                 # Fallback for stream objects without iter_chunks()
                 try:
                     body.read()
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception:  # noqa: BLE001
-                pass
+                except Exception as read_err:  # noqa: BLE001
+                    logger.debug("Stream read while draining failed: %s", read_err)
+            except Exception as drain_err:  # noqa: BLE001
+                logger.debug("Stream drain failed: %s", drain_err)
         logger.info("Remote AgentCore invocation completed (session=%s)", session_id)
     except Exception as e:  # noqa: BLE001
         # Best-effort only — never break the UI over a logging call.

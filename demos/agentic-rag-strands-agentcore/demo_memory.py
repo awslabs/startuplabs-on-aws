@@ -17,13 +17,14 @@ import os
 import sys
 import time
 import uuid
+import logging
 from datetime import datetime
 
 # Ensure UTF-8 output so the script runs on Windows consoles (cp1252) too.
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+except Exception:  # noqa: S110 - console encoding is best-effort; safe to ignore
+    logging.debug("stdout.reconfigure not supported on this platform")
 
 from dotenv import load_dotenv
 
@@ -62,8 +63,8 @@ def _has_stored_memory() -> bool:
             )
             if recs:
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug("Memory poll for namespace %s failed: %s", ns, e)
     return False
 
 

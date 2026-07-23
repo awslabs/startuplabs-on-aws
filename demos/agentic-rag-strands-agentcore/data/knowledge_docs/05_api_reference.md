@@ -123,7 +123,7 @@ Official SDK libraries are available for:
 from novatech import NovaTechClient
 
 client = NovaTechClient(
-    api_key="your-api-key",
+    api_key=os.environ["NOVATECH_API_KEY"],  # read from environment, never hardcode
     region="us-east-1"
 )
 
