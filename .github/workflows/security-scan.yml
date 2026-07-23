@@ -1,6 +1,7 @@
 name: ASH Security Scan
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main]
   push:
@@ -15,34 +16,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
-      - name: Install UV
-        run: curl -sSf https://astral.sh/uv/install.sh | sh
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
 
       - name: Install ASH
-        run: uvx git+https://github.com/awslabs/automated-security-helper.git@v3.5.4 --help
+        run: pip install 'automated-security-helper[cdk] @ git+https://github.com/awslabs/automated-security-helper.git@v3'
+
+      - name: Install scanner dependencies
+        run: |
+          # Grype - vulnerability scanner for containers and dependencies
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          # Syft - SBOM generator
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          # cfn-nag - CloudFormation security linter
+          sudo gem install cfn-nag
 
       - name: Run ASH scan
-        run: |
-          uvx git+https://github.com/awslabs/automated-security-helper.git@v3.5.4 \
-            --config .ash/.ash.yaml \
-            --output-format sarif \
-            --output-dir ash-results
+        run: ash --mode local
 
-      - name: Upload SARIF results
+      - name: Upload SARIF to GitHub Advanced Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7
         with:
-          sarif_file: ash-results/
+          sarif_file: .ash/ash_output/reports/ash.sarif
+          category: ash-security-scan
 
-      - name: Check for findings
-        run: |
-          if [ -f ash-results/results.json ]; then
-            FINDINGS=$(jq '.findings | length' ash-results/results.json)
-            if [ "$FINDINGS" -gt 0 ]; then
-              echo "ASH found $FINDINGS security finding(s). Blocking merge."
-              exit 1
-            fi
-          fi
-          echo "No actionable security findings."
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: ash-results
+          path: .ash/ash_output/
