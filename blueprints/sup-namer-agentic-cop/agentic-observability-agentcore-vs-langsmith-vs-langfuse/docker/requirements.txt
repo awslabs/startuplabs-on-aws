@@ -4,7 +4,7 @@ uvicorn==0.34.2
 pydantic==2.10.6
 
 # LangChain / LangGraph stack (Bedrock Claude via ChatBedrock)
-langchain-aws>=0.2.15
+langchain-aws>=0.2.15,<0.3
 # Langfuse's `langfuse.langchain` callback handler imports the top-level
 # `langchain` package at module import time. We don't use `langchain` directly
 # in the agent, but Langfuse requires it. Pinned to the 0.3.x line to stay
@@ -32,10 +32,15 @@ langsmith
 # AWS OTEL Distro — applies SigV4 to AWS OTLP endpoints automatically and brings
 # a coherent opentelemetry-api/sdk/exporter/propagator set (incl. the X-Ray
 # propagator and OTLP HTTP exporter the pod uses via env vars).
-aws-opentelemetry-distro>=0.10.0
-# Instrumentations the app imports directly (versions resolve against ADOT core).
+aws-opentelemetry-distro>=0.19.0,<0.20
+# Instrumentations the app imports directly. The ``opentelemetry-instrumentation-*``
+# packages share a single version line that must match ADOT's pinned core, so
+# ``requests`` is pinned to the exact version ADOT 0.19.x pins
+# (``opentelemetry-instrumentation==0.65b0``). If you raise the ADOT bound above,
+# bump this pin in lockstep or the resolve fails (ResolutionImpossible).
+# ``fastapi`` is left unpinned so it resolves against ADOT's pinned core.
 opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-requests==0.65b0
 # Traceloop instrumentation for LangChain/LangGraph. Required for LangGraph
 # sessions to appear in the AgentCore Observability GenAI console.
 opentelemetry-instrumentation-langchain>=0.48.0

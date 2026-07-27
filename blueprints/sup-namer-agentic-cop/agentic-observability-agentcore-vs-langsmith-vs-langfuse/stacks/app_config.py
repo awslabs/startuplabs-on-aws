@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -48,9 +49,21 @@ DEFAULT_AGENTCORE_ENABLED = True
 # afterward). Lets the person who will run ``kubectl`` reach the cluster without
 # the post-deploy "you must be logged in to the server" access-entry dance.
 DEFAULT_CLUSTER_ADMIN_ROLE_ARN = ""
+# Opt-in (default off) pre-flight that verifies the configured Bedrock model IDs
+# are available in the target region before synth. Off by default because the
+# sample ships forward-looking default model IDs and because plain ``cdk synth``
+# and the unit tests run without AWS credentials. See
+# ``AppConfig._validate_model_availability``.
+DEFAULT_CHECK_MODEL_AVAILABILITY = False
 
 # Sentinel used to mean "the Operator did not override this value".
 _UNSET = object()
+
+# Regional prefixes used by cross-region (system-defined) inference-profile IDs,
+# e.g. ``us.anthropic.claude-...``. Used to reconcile a configured profile ID
+# with its underlying base foundation-model ID (and vice versa) during the
+# optional model-availability pre-flight.
+_INFERENCE_PROFILE_PREFIXES = ("us.", "eu.", "apac.", "us-gov.")
 
 # Name of the optional example inputs file read as the lowest-precedence
 # explicit source (above built-in defaults).
@@ -268,6 +281,10 @@ class AppConfig:
     # AgentCore platform.
     agentcore_enabled: bool
 
+    # Opt-in Bedrock model-availability pre-flight (default off). Kept last with a
+    # default so existing positional/keyword construction stays backward-compatible.
+    check_model_availability: bool = False
+
     @property
     def creates_cluster(self) -> bool:
         """Whether the app should provision a new EKS cluster.
@@ -369,6 +386,11 @@ class AppConfig:
             agentcore_enabled=get(
                 "agentcoreEnabled", DEFAULT_AGENTCORE_ENABLED, cast="bool"
             ),
+            check_model_availability=get(
+                "checkModelAvailability",
+                DEFAULT_CHECK_MODEL_AVAILABILITY,
+                cast="bool",
+            ),
         )
 
         # Fail fast before synth: invalid or missing inputs raise here, before
@@ -417,6 +439,7 @@ class AppConfig:
         self._validate_agent_name()
         self._validate_node_sizing()
         self._validate_cluster_admin_role_arn()
+        self._validate_model_availability()
 
     def _collect_missing_required(self) -> list[str]:
         """Return the names of every required input that has no usable value.
@@ -580,3 +603,162 @@ class AppConfig:
                 "skip creating an EKS access entry and grant cluster access "
                 "manually after deploy."
             )
+
+    def _validate_model_availability(self) -> None:
+        """Best-effort pre-flight that the configured models exist in the region.
+
+        Opt-in (``checkModelAvailability`` context / ``CHECK_MODEL_AVAILABILITY``
+        env; default off) because the sample ships forward-looking default model
+        IDs and because plain ``cdk synth`` and the unit tests run without AWS
+        credentials. When enabled it *fails gracefully*:
+
+        * If the check cannot be performed at all — boto3 missing, no credentials,
+          or any Bedrock API/network error — it emits a warning and returns
+          without raising, so an infrastructure hiccup never blocks a deploy.
+        * Only a *positive* determination that a configured model is absent from
+          the region raises ``ValueError`` (fail-fast, before synth), with
+          guidance to enable Bedrock model access, pick another region/model, or
+          leave the (default-off) check disabled.
+
+        The model inputs may be a base foundation-model ID or a cross-region
+        inference-profile ID (``us.anthropic.claude-...``), so both Bedrock
+        listings are consulted and reconciled (see :meth:`_list_bedrock_model_ids`
+        and :func:`_model_is_available`).
+        """
+        if not self.check_model_availability:
+            return
+
+        region = (self.region or "").strip()
+        if not region:
+            # Region validity is enforced by _validate_region; nothing to check
+            # against here.
+            return
+
+        wanted = {m for m in (self.model_id, self.judge_model_id) if _has_value(m)}
+        if not wanted:
+            return
+
+        try:
+            import boto3
+            from botocore.config import Config as BotoConfig
+        except ImportError:
+            warnings.warn(
+                "checkModelAvailability is enabled but boto3 is not importable; "
+                "skipping the Bedrock model-availability pre-flight.",
+                stacklevel=2,
+            )
+            return
+
+        # Do not attempt a network call when no credentials are configured. This
+        # keeps credential-free ``cdk synth`` and unit tests fast and side-effect
+        # free even with the check enabled.
+        try:
+            if boto3.Session().get_credentials() is None:
+                warnings.warn(
+                    "checkModelAvailability is enabled but no AWS credentials "
+                    "were found; skipping the Bedrock model-availability "
+                    "pre-flight.",
+                    stacklevel=2,
+                )
+                return
+        except Exception:  # pragma: no cover - defensive; treat as "cannot check"
+            return
+
+        try:
+            client = boto3.client(
+                "bedrock",
+                region_name=region,
+                # Fail fast instead of hanging if Bedrock is unreachable.
+                config=BotoConfig(
+                    connect_timeout=5,
+                    read_timeout=10,
+                    retries={"max_attempts": 1},
+                ),
+            )
+            available = self._list_bedrock_model_ids(client)
+        except Exception as exc:  # graceful skip on any API/network/permission error
+            warnings.warn(
+                f"Could not verify Bedrock model availability in '{region}' "
+                f"({type(exc).__name__}); skipping the pre-flight. Underlying "
+                f"error: {exc}",
+                stacklevel=2,
+            )
+            return
+
+        if not available:
+            # Inconclusive enumeration — do not block the deploy on it.
+            return
+
+        missing = sorted(m for m in wanted if not _model_is_available(m, available))
+        if missing:
+            raise ValueError(
+                "Model availability check failed: the following model ID(s) are "
+                f"not available in region '{region}': {', '.join(missing)}. Enable "
+                "model access for them in the Amazon Bedrock console, choose a "
+                "different region or modelId/judgeModelId, or disable this "
+                "pre-flight (it is off unless checkModelAvailability is set)."
+            )
+
+    @staticmethod
+    def _list_bedrock_model_ids(client: Any) -> set[str]:
+        """Return the set of model identifiers usable in the region.
+
+        Combines base foundation-model IDs (``list_foundation_models``) with
+        system-defined cross-region inference-profile IDs
+        (``list_inference_profiles``), since a configured model input may be
+        either form. A failure of one source is non-fatal — whatever can be
+        enumerated is returned, and an empty result makes the caller treat the
+        check as inconclusive.
+        """
+        identifiers: set[str] = set()
+
+        # Base foundation-model IDs.
+        try:
+            response = client.list_foundation_models()
+            for summary in response.get("modelSummaries", []):
+                model_id = summary.get("modelId")
+                if model_id:
+                    identifiers.add(model_id)
+        except Exception:  # pragma: no cover - one source failing is non-fatal
+            pass
+
+        # System-defined inference profiles (cross-region IDs), paginated.
+        try:
+            next_token: Optional[str] = None
+            while True:
+                kwargs: dict[str, Any] = {
+                    "typeEquals": "SYSTEM_DEFINED",
+                    "maxResults": 100,
+                }
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                response = client.list_inference_profiles(**kwargs)
+                for profile in response.get("inferenceProfileSummaries", []):
+                    profile_id = profile.get("inferenceProfileId")
+                    if profile_id:
+                        identifiers.add(profile_id)
+                next_token = response.get("nextToken")
+                if not next_token:
+                    break
+        except Exception:  # pragma: no cover - one source failing is non-fatal
+            pass
+
+        return identifiers
+
+
+def _model_is_available(model_id: str, identifiers: set[str]) -> bool:
+    """Whether a configured model ID matches one of the available identifiers.
+
+    Matches directly, or after reconciling a cross-region inference-profile ID
+    with its base foundation-model ID in either direction: a profile ID
+    (``us.anthropic.claude-...``) matches when its stripped base is available,
+    and a base ID matches when the corresponding profile ID is available.
+    """
+    if model_id in identifiers:
+        return True
+    for prefix in _INFERENCE_PROFILE_PREFIXES:
+        if model_id.startswith(prefix) and model_id[len(prefix):] in identifiers:
+            return True
+        if (prefix + model_id) in identifiers:
+            return True
+    return False

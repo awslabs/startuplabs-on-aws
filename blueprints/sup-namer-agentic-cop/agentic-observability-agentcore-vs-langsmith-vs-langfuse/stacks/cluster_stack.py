@@ -255,13 +255,14 @@ class ClusterStack(Stack):
             # managed node group below so sizing is unambiguous and validated
             # (design DD-3, Requirement 2.1).
             default_capacity=0,
-            # Use EKS access entries (plus the legacy aws-auth ConfigMap) for
-            # authorization. This is what lets ``grant_access`` below wire an
-            # operator's IAM principal to Kubernetes RBAC. Without an API-capable
-            # auth mode, a human running ``kubectl`` against a CDK-created cluster
-            # hits "you must be logged in to the server" because only the CDK
-            # deploy role is mapped.
-            authentication_mode=eks.AuthenticationMode.API_AND_CONFIG_MAP,
+            # Use EKS access entries exclusively (API authentication mode). The
+            # legacy aws-auth ConfigMap is no longer recommended, so it is not
+            # enabled — all Kubernetes authorization flows through access entries,
+            # which is what lets ``grant_access`` below wire an operator's IAM
+            # principal to Kubernetes RBAC. Without an API auth mode a human
+            # running ``kubectl`` against a CDK-created cluster hits "you must be
+            # logged in to the server" because only the CDK deploy role is mapped.
+            authentication_mode=eks.AuthenticationMode.API,
             # The kubectl layer lets CDK apply Kubernetes manifests and Helm
             # charts (used by tasks 5.3, 8, and 9). Pinned to the v30 layer to
             # match the 1.30 control plane.

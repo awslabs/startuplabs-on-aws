@@ -255,6 +255,73 @@ port-forward/test commands as outputs.
 > flag, grant access after deploy with `aws eks create-access-entry` +
 > `aws eks associate-access-policy`.
 
+### Cluster access & the `clusterAdminRoleArn` break-glass role
+
+The cluster uses **EKS access entries** (`authentication_mode = API` in
+[`stacks/cluster_stack.py`](stacks/cluster_stack.py)); the legacy `aws-auth`
+ConfigMap is intentionally **not** enabled, because ConfigMap-based auth is no
+longer recommended. All Kubernetes authorization therefore flows through access
+entries.
+
+By default CDK maps only the deploy / CloudFormation-execution role as
+cluster-admin — which is why `kubectl` as your own identity returns *"you must be
+logged in to the server"* (older `kubectl`) or *"the server has asked for the
+client to provide credentials"* (newer `kubectl`). When you pass
+`-c clusterAdminRoleArn=<iam-role-arn>`, `ClusterStack._create_cluster` calls
+`cluster.grant_access(...)` to attach the AWS-managed
+`AmazonEKSClusterAdminPolicy` (cluster scope) to that principal via an access
+entry, so the person who will run `kubectl` is mapped at deploy time.
+
+> **Treat this principal as break-glass.** `AmazonEKSClusterAdminPolicy` is full
+> cluster-admin — the Kubernetes equivalent of root. Grant it only to a role you
+> control, and use it only to bootstrap access or recover from a lockout. For
+> day-to-day work prefer a least-privilege access policy (e.g.
+> `AmazonEKSEditPolicy` or `AmazonEKSViewPolicy`, optionally namespace-scoped),
+> and remove the entry when it is no longer needed:
+> `aws eks delete-access-entry --cluster-name <name> --principal-arn <arn>`.
+
+The ARN must be an **IAM role or user ARN** (`arn:aws:iam::<account>:role/<name>`),
+not the STS assumed-role *session* ARN that `aws sts get-caller-identity` returns
+under an assumed role; `AppConfig` validates this before synth. If you omit the
+flag, grant access after deploy with `aws eks create-access-entry` +
+`aws eks associate-access-policy`.
+
+### Configuration — `cdk deploy` context overrides
+
+Every input is resolved with the precedence **CDK context (`-c key=value` or
+`cdk.json`) > environment variable > `config.json` > built-in default** (see
+[`stacks/app_config.py`](stacks/app_config.py)). Override on the CLI, e.g.:
+
+```bash
+cdk deploy --all \
+  -c agentName=my-agent \
+  -c region=us-west-2 \
+  -c langfuseEnabled=false
+```
+
+| Context key (`-c key=value`) | Env var | Default | Purpose |
+| --- | --- | --- | --- |
+| `account` | `CDK_DEFAULT_ACCOUNT` | (from CDK/AWS env) | Target AWS account (12 digits) |
+| `region` | `CDK_DEFAULT_REGION` / `AWS_REGION` | (from CDK/AWS env) | Target AWS region |
+| `agentName` | `AGENT_NAME` | `langgraph-shopping-agent` | Name propagated to ECR / logs / K8s resources and the secret paths |
+| `modelId` | `MODEL_ID` | `us.anthropic.claude-sonnet-5` | Bedrock model (inference profile) the agent invokes |
+| `judgeModelId` | `JUDGE_MODEL_ID` | `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Model used for LLM-as-judge evaluation |
+| `nodeType` | `NODE_TYPE` | `t3.medium` | EKS managed node group instance type |
+| `nodesDesired` / `nodesMin` / `nodesMax` | `NODES_DESIRED` / `NODES_MIN` / `NODES_MAX` | `2` / `1` / `3` | Node group sizing (`min <= desired <= max`, `max <= 100`) |
+| `existingClusterName` | `EXISTING_CLUSTER_NAME` | `none` | Reuse an existing EKS cluster instead of creating one |
+| `clusterAdminRoleArn` | `CLUSTER_ADMIN_ROLE_ARN` | (empty) | IAM role/user ARN granted cluster-admin via an access entry (see above) |
+| `checkModelAvailability` | `CHECK_MODEL_AVAILABILITY` | `false` | Opt-in pre-flight that `modelId` / `judgeModelId` are available in `region` (fails gracefully; needs Bedrock read access + credentials) |
+| `langsmithEnabled` | `LANGSMITH_ENABLED` | `true` | Toggle LangSmith instrumentation |
+| `langsmithProject` | `LANGSMITH_PROJECT` | `langgraph-shopping-agent` | LangSmith project name |
+| `langsmithSecretName` | `LANGSMITH_SECRET_NAME` | `agent-observability/<agent>/langsmith` | Secrets Manager name for the LangSmith key |
+| `langfuseEnabled` | `LANGFUSE_ENABLED` | `true` | Toggle Langfuse instrumentation |
+| `langfuseHost` | `LANGFUSE_HOST` | `https://us.cloud.langfuse.com` | Langfuse host (US / EU cloud or self-hosted) |
+| `langfuseSecretName` | `LANGFUSE_SECRET_NAME` | `agent-observability/<agent>/langfuse` | Secrets Manager name for the Langfuse keys |
+| `agentcoreEnabled` | `AGENTCORE_ENABLED` | `true` | Toggle AgentCore Observability |
+
+Disabled platforms (`-c langsmithEnabled=false` / `-c langfuseEnabled=false`)
+create no secret and require none of their other inputs.
+
 ### Populate the SaaS credentials (LangSmith / Langfuse)
 
 CDK creates the LangSmith and Langfuse secrets **empty** — no credential ever
