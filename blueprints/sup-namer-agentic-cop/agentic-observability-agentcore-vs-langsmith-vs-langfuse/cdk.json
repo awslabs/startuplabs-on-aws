@@ -1,0 +1,55 @@
+{
+  "app": "python3 app.py",
+  "watch": {
+    "include": [
+      "**"
+    ],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "requirements*.txt",
+      "**/__pycache__",
+      "**/*.pyc",
+      "cdk.out",
+      ".venv"
+    ]
+  },
+  "context": {
+    "agentName": "langgraph-shopping-agent",
+    "modelId": "us.anthropic.claude-sonnet-5",
+    "judgeModelId": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    "nodeType": "t3.medium",
+    "nodesDesired": 2,
+    "nodesMin": 1,
+    "nodesMax": 3,
+    "langsmithEnabled": true,
+    "langsmithProject": "langgraph-shopping-agent",
+    "langfuseEnabled": true,
+    "langfuseHost": "https://us.cloud.langfuse.com",
+    "agentcoreEnabled": true,
+
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:target-partitions": [
+      "aws",
+      "aws-cn"
+    ],
+    "@aws-cdk-containers/ecs-service-extensions:enableDefaultLogDriver": true,
+    "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true,
+    "@aws-cdk/aws-ecs:arnFormatIncludesClusterName": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:validateSnapshotRemovalPolicy": true,
+    "@aws-cdk/aws-codepipeline:crossAccountKeyAliasStackSafeResourceName": true,
+    "@aws-cdk/aws-s3:createDefaultLoggingPolicy": true,
+    "@aws-cdk/aws-sns-subscriptions:restrictSqsDescryption": true,
+    "@aws-cdk/aws-apigateway:disableCloudWatchRole": true,
+    "@aws-cdk/core:enablePartitionLiterals": true,
+    "@aws-cdk/aws-events:eventsTargetQueueSameAccount": true,
+    "@aws-cdk/aws-iam:standardizedServicePrincipals": true,
+    "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true,
+    "@aws-cdk/aws-lambda:recognizeVersionProps": true,
+    "@aws-cdk/aws-cloudfront:defaultSecurityPolicyTLSv1.2_2021": true,
+    "@aws-cdk/core:defaultCrossStackReferences": "strong",
+    "@aws-cdk/core:bootstrapQualifier": "hnb659fds"
+  }
+}

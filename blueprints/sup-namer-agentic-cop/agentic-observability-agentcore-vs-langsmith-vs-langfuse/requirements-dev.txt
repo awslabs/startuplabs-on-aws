@@ -1,0 +1,5 @@
+# Development / test dependencies for the CDK app.
+# Install with:  pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+
+pytest>=8.0.0,<9.0.0
