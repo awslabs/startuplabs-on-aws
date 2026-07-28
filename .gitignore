@@ -56,3 +56,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.pytest_cache/
+
+# AWS CDK synthesized output
+cdk.out/

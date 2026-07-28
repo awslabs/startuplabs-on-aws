@@ -1,0 +1,55 @@
+THIRD-PARTY LICENSES
+====================
+
+This project depends on the third-party open source packages listed below, each
+subject to its own license. This file enumerates the project's DIRECT
+dependencies (those declared in `requirements.txt` and `docker/requirements.txt`)
+and the license each publisher declares on PyPI. Transitive dependencies are not
+enumerated here; for a complete, resolved transitive report run a tool such as
+`pip-licenses` against an installed environment.
+
+No third-party source code, images, datasets, or machine-learning models are
+bundled or redistributed in this repository. The sample's product catalog is
+synthetic data defined inline for demonstration, and foundation models (e.g.
+Amazon Bedrock Claude / Nova) are invoked through the Amazon Bedrock API at
+runtime — they are not included in this repository.
+
+It is your responsibility to review these licenses and confirm the associated
+obligations are acceptable for your use case.
+
+
+CDK application (requirements.txt)
+----------------------------------
+- aws-cdk-lib ................................ Apache-2.0
+- constructs ................................. Apache-2.0
+- deploy-time-build .......................... MIT
+- aws-cdk.lambda-layer-kubectl-v30 ........... Apache-2.0
+
+
+Agent container image (docker/requirements.txt)
+------------------------------------------------
+- fastapi .................................... MIT
+- uvicorn .................................... BSD-3-Clause
+- pydantic ................................... MIT
+- langchain .................................. MIT
+- langchain-core ............................. MIT
+- langchain-aws .............................. MIT
+- langgraph .................................. MIT
+- langsmith .................................. MIT
+- langfuse ................................... MIT
+- boto3 ...................................... Apache-2.0
+- aws-opentelemetry-distro ................... Apache-2.0
+- opentelemetry-instrumentation-fastapi ...... Apache-2.0
+- opentelemetry-instrumentation-requests ..... Apache-2.0
+- opentelemetry-instrumentation-langchain .... Apache-2.0
+
+
+License texts
+-------------
+- Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0
+- MIT: https://opensource.org/license/mit
+- BSD-3-Clause: https://opensource.org/license/bsd-3-clause
+
+Licenses reflect each publisher's declared license on PyPI at the time of
+writing and may change in newer releases; verify against the versions you
+resolve.
