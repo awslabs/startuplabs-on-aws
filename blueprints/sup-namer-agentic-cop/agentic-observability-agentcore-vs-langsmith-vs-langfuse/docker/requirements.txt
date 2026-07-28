@@ -10,7 +10,7 @@ langchain-aws>=0.2.15,<0.3
 # in the agent, but Langfuse requires it. Pinned to the 0.3.x line to stay
 # compatible with langchain-core 0.3.x.
 langchain>=0.3.0,<0.4
-langgraph==0.2.62
+langgraph==1.0.10rc1
 langchain-core>=0.3.29,<0.4
 
 # AWS SDK + LangSmith client (already required transitively, pinned for clarity)
