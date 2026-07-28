@@ -43,7 +43,7 @@ let the user know and suggest what they could do next (e.g., contact support, ch
 
 RETRIEVAL_QUERY_REWRITE_PROMPT = """Given the user's question, generate an optimized search query \
 for retrieving relevant documents from a knowledge base about NovaTech Solutions' products \
-(NovaPlatform, NovaInsight, NovaGuard). 
+(NovaPlatform, NovaInsight, NovaGuard).
 
 The query should:
 - Be concise and focused on key terms
