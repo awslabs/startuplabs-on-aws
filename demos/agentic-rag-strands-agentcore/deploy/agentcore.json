@@ -1,0 +1,21 @@
+{
+  "name": "novatech-rag-agent",
+  "description": "Agentic RAG agent for NovaTech documentation powered by Strands Agents SDK",
+  "framework": "strands",
+  "runtime": "python3.12",
+  "entryPoint": "deploy/agentcore_handler.py",
+  "handler": "handler",
+  "environment": {
+    "AWS_REGION": "${AWS_REGION}",
+    "KNOWLEDGE_BASE_ID": "${KNOWLEDGE_BASE_ID}",
+    "INFERENCE_MODEL_ID": "${INFERENCE_MODEL_ID}",
+    "OTEL_SERVICE_NAME": "novatech-rag-agent"
+  },
+  "scaling": {
+    "minInstances": 1,
+    "maxInstances": 5,
+    "targetConcurrency": 10
+  },
+  "timeout": 120,
+  "memorySize": 1024
+}

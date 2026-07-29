@@ -1,0 +1,13 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Lockfile is generated on `npm install`; not committed to avoid pinning
+# transitive-dependency CVEs (regenerated fresh against current patched deps).
+package-lock.json
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
