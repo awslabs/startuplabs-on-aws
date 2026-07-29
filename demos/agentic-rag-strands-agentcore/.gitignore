@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Evaluations results (generated)
+evaluations/results/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AgentCore
+.agentcore/
+**/.cli/
+**/.cache/
+**/cdk.out/
+**/.env.local
+deployed-state.json
+
+# Node / CDK
+node_modules/
+**/node_modules/
+
+# Secrets / local env (belt and suspenders)
+.env
+*.env
+!.env.example
