@@ -55,7 +55,7 @@ agentic-rag-demo/
 ├── agent/
 │   ├── __init__.py
 │   ├── rag_agent.py                 # Core RAG agent definition
-│   ├── tools.py                     # Custom tools (retrieve, summarize)
+│   ├── tools.py                     # Custom tools (retrieve_from_kb)
 │   ├── prompts.py                   # System prompts
 │   └── observability.py             # OpenTelemetry setup
 ├── evaluations/

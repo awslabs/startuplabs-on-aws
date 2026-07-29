@@ -29,9 +29,12 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# Load environment variables
+# Load environment variables (handles values with spaces/special chars safely)
 if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
 fi
 
 echo "📋 Configuration:"

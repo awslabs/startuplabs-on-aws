@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
-BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "agentic-rag-demo-docs")
 EMBEDDING_MODEL_ID = os.getenv("EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0")
 KB_NAME = "novatech-knowledge-base"
 COLLECTION_NAME = "novatech-vectors"
@@ -35,26 +34,39 @@ def get_account_id():
     return sts.get_caller_identity()["Account"]
 
 
-def create_s3_bucket(s3_client):
+def resolve_bucket_name(account_id):
+    """Resolve the S3 bucket name.
+
+    S3 bucket names are globally unique, so a fixed default would collide across
+    accounts. Prefer an explicit S3_BUCKET_NAME; otherwise derive a
+    per-account-unique name by suffixing the account ID.
+    """
+    explicit = os.getenv("S3_BUCKET_NAME")
+    if explicit:
+        return explicit
+    return f"agentic-rag-demo-docs-{account_id}"
+
+
+def create_s3_bucket(s3_client, bucket_name):
     """Create the S3 bucket for document storage."""
-    print(f"Creating S3 bucket: {BUCKET_NAME}")
+    print(f"Creating S3 bucket: {bucket_name}")
     try:
         if REGION == "us-east-1":
-            s3_client.create_bucket(Bucket=BUCKET_NAME)
+            s3_client.create_bucket(Bucket=bucket_name)
         else:
             s3_client.create_bucket(
-                Bucket=BUCKET_NAME,
+                Bucket=bucket_name,
                 CreateBucketConfiguration={"LocationConstraint": REGION},
             )
-        print(f"  ✓ Bucket created: {BUCKET_NAME}")
+        print(f"  ✓ Bucket created: {bucket_name}")
     except s3_client.exceptions.BucketAlreadyOwnedByYou:
-        print(f"  ✓ Bucket already exists: {BUCKET_NAME}")
+        print(f"  ✓ Bucket already exists: {bucket_name}")
     except Exception as e:
         print(f"  ✗ Error creating bucket: {e}")
         raise
 
 
-def create_kb_execution_role(iam_client, account_id):
+def create_kb_execution_role(iam_client, account_id, bucket_name, collection_id):
     """Create IAM role for the Knowledge Base."""
     role_name = "AgenticRAGKnowledgeBaseRole"
     print(f"Creating IAM role: {role_name}")
@@ -93,8 +105,8 @@ def create_kb_execution_role(iam_client, account_id):
                 "Effect": "Allow",
                 "Action": ["s3:GetObject", "s3:ListBucket"],
                 "Resource": [
-                    f"arn:aws:s3:::{BUCKET_NAME}",
-                    f"arn:aws:s3:::{BUCKET_NAME}/*",
+                    f"arn:aws:s3:::{bucket_name}",
+                    f"arn:aws:s3:::{bucket_name}/*",
                 ],
             },
             {
@@ -107,13 +119,10 @@ def create_kb_execution_role(iam_client, account_id):
             {
                 "Effect": "Allow",
                 "Action": ["aoss:APIAccessAll"],
-                # Scoped to this specific collection rather than "*".
+                # Scoped to this specific collection (by ARN), not all collections.
                 "Resource": [
-                    f"arn:aws:aoss:{REGION}:{account_id}:collection/*"
+                    f"arn:aws:aoss:{REGION}:{account_id}:collection/{collection_id}"
                 ],
-                "Condition": {
-                    "StringEquals": {"aoss:collection": COLLECTION_NAME}
-                },
             },
         ],
     }
@@ -328,7 +337,7 @@ def create_knowledge_base(bedrock_agent_client, role_arn, collection_arn):
         raise
 
 
-def create_data_source(bedrock_agent_client, kb_id):
+def create_data_source(bedrock_agent_client, kb_id, bucket_name):
     """Create an S3 data source for the Knowledge Base."""
     print("Creating data source...")
 
@@ -340,7 +349,7 @@ def create_data_source(bedrock_agent_client, kb_id):
             dataSourceConfiguration={
                 "type": "S3",
                 "s3Configuration": {
-                    "bucketArn": f"arn:aws:s3:::{BUCKET_NAME}",
+                    "bucketArn": f"arn:aws:s3:::{bucket_name}",
                     "inclusionPrefixes": ["knowledge_docs/"],
                 },
             },
@@ -369,8 +378,10 @@ def main():
     print("=" * 60 + "\n")
 
     account_id = get_account_id()
+    bucket_name = resolve_bucket_name(account_id)
     print(f"Account ID: {account_id}")
-    print(f"Region: {REGION}\n")
+    print(f"Region: {REGION}")
+    print(f"S3 Bucket: {bucket_name}\n")
 
     # Initialize clients
     s3_client = boto3.client("s3", region_name=REGION)
@@ -379,20 +390,21 @@ def main():
     bedrock_agent_client = boto3.client("bedrock-agent", region_name=REGION)
 
     # Step 1: Create S3 bucket
-    create_s3_bucket(s3_client)
+    create_s3_bucket(s3_client, bucket_name)
 
-    # Step 2: Create IAM role
-    role_arn = create_kb_execution_role(iam_client, account_id)
-
-    # Step 3: Create OpenSearch Serverless collection
+    # Step 2: Create OpenSearch Serverless collection first, so the IAM role can
+    # be scoped to this specific collection's ARN.
     collection_id, endpoint = create_opensearch_collection(aoss_client, account_id)
     collection_arn = f"arn:aws:aoss:{REGION}:{account_id}:collection/{collection_id}"
+
+    # Step 3: Create IAM role scoped to the actual bucket and collection
+    role_arn = create_kb_execution_role(iam_client, account_id, bucket_name, collection_id)
 
     # Step 4: Create Knowledge Base
     kb_id = create_knowledge_base(bedrock_agent_client, role_arn, collection_arn)
 
     # Step 5: Create data source
-    ds_id = create_data_source(bedrock_agent_client, kb_id)
+    ds_id = create_data_source(bedrock_agent_client, kb_id, bucket_name)
 
     # Output configuration
     print("\n" + "=" * 60)
@@ -400,11 +412,11 @@ def main():
     print("=" * 60)
     print(f"\n  Knowledge Base ID: {kb_id}")
     print(f"  Data Source ID:    {ds_id}")
-    print(f"  S3 Bucket:         {BUCKET_NAME}")
+    print(f"  S3 Bucket:         {bucket_name}")
     print(f"  Collection:        {endpoint}")
     print(f"\n  Update your .env file:")
     print(f"    KNOWLEDGE_BASE_ID={kb_id}")
-    print(f"    S3_BUCKET_NAME={BUCKET_NAME}")
+    print(f"    S3_BUCKET_NAME={bucket_name}")
     print("\n  Next step: Run 'python infrastructure/upload_data.py' to upload documents")
 
 

@@ -76,27 +76,3 @@ def retrieve_from_kb(query: str, num_results: int = 8) -> str:
 
     except Exception as e:
         return f"Error retrieving from knowledge base: {str(e)}"
-
-
-@tool
-def summarize_context(context: str, focus: str = "") -> str:
-    """Summarize retrieved context, optionally focusing on specific aspects.
-
-    Use this tool when the retrieved context is very long and you need
-    a concise summary before formulating your answer.
-
-    Args:
-        context: The retrieved text to summarize.
-        focus: Optional focus area for the summary (e.g., 'pricing', 'technical architecture').
-
-    Returns:
-        A concise summary of the provided context.
-    """
-    # This tool uses the agent's own LLM to summarize
-    # The Strands framework handles the LLM call through the agent's model
-    word_count = len(context.split())
-    focus_note = f" (focused on: {focus})" if focus else ""
-    return (
-        f"Context contains {word_count} words{focus_note}. "
-        f"Key information has been extracted from the retrieved passages."
-    )

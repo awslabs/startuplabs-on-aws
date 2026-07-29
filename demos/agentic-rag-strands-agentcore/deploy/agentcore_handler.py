@@ -21,7 +21,7 @@ from strands import Agent
 from strands.models.bedrock import BedrockModel
 
 from agent.prompts import RAG_SYSTEM_PROMPT
-from agent.tools import retrieve_from_kb, summarize_context
+from agent.tools import retrieve_from_kb
 
 
 def build_agent() -> Agent:
@@ -44,7 +44,7 @@ def build_agent() -> Agent:
     agent = Agent(
         model=model,
         system_prompt=RAG_SYSTEM_PROMPT,
-        tools=[retrieve_from_kb, summarize_context],
+        tools=[retrieve_from_kb],
         callback_handler=None,
     )
 

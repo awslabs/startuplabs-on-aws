@@ -89,8 +89,7 @@ test_pass is true when the score is >= 0.66.
 """
 
 _TRAJECTORY_RUBRIC = """
-Evaluate the agent's tool-use trajectory. Available tools: retrieve_from_kb,
-summarize_context.
+Evaluate the agent's tool-use trajectory. Available tool: retrieve_from_kb.
 
 Core principle: for an information-seeking question about NovaTech, the agent
 MUST call retrieve_from_kb before answering (never answer from memory). For

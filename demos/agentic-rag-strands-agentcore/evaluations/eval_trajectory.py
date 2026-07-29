@@ -31,15 +31,14 @@ def run_trajectory_evaluation() -> dict:
 
     Verifies the agent follows the correct tool usage pattern:
     1. Always calls retrieve_from_kb before answering
-    2. Uses summarize_context when context is lengthy
-    3. Doesn't make unnecessary tool calls
+    2. Doesn't make unnecessary tool calls
     """
     evaluator = TrajectoryEvaluator(
         rubric="""
         Evaluate the agent's tool usage trajectory for a RAG agent:
 
-        Use the `expected_trajectory` to judge correctness. The tools available
-        are: retrieve_from_kb, summarize_context.
+        Use the `expected_trajectory` to judge correctness. The tool available
+        is: retrieve_from_kb.
 
         **Core principle**: For any question seeking information about NovaTech, the
         agent MUST call `retrieve_from_kb` before answering — it should never answer

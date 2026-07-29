@@ -6,7 +6,7 @@ from strands import Agent
 from strands.models.bedrock import BedrockModel
 
 from agent.prompts import RAG_SYSTEM_PROMPT
-from agent.tools import retrieve_from_kb, summarize_context
+from agent.tools import retrieve_from_kb
 from agent.observability import setup_observability
 
 # Load environment variables
@@ -106,7 +106,7 @@ def create_memory_enabled_agent(
     agent = Agent(
         model=model,
         system_prompt=MEMORY_SYSTEM_PROMPT,
-        tools=[retrieve_from_kb, summarize_context],
+        tools=[retrieve_from_kb],
         session_manager=session_manager,
         callback_handler=callback_handler,
     )
@@ -125,7 +125,6 @@ def create_rag_agent(
     Creates a Strands Agent configured with:
     - Mistral Large 3 as the inference model (via Bedrock)
     - retrieve_from_kb tool for knowledge base retrieval
-    - summarize_context tool for condensing long passages
     - OpenTelemetry tracing for observability
 
     Args:
@@ -157,7 +156,7 @@ def create_rag_agent(
     agent = Agent(
         model=model,
         system_prompt=RAG_SYSTEM_PROMPT,
-        tools=[retrieve_from_kb, summarize_context],
+        tools=[retrieve_from_kb],
         callback_handler=callback_handler,
     )
 

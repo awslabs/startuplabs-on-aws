@@ -265,7 +265,7 @@ def render_trace_info(trajectory=None):
                 ),
                 "knowledge_base_id": os.getenv("KNOWLEDGE_BASE_ID", "not-configured"),
                 "region": os.getenv("KNOWLEDGE_BASE_REGION", "us-east-1"),
-                "tools_available": ["retrieve_from_kb", "summarize_context"],
+                "tools_available": ["retrieve_from_kb"],
                 "tools_invoked_this_turn": tools_fired or ["(none)"],
                 "runtime_session_id": session_id,
             }
@@ -445,7 +445,6 @@ def render_architecture_tab():
         subgraph cluster_tools {
             label="Agent Tools"; style="rounded,dashed"; color="#9CA3AF"; fontcolor="#6B7280";
             retrieve [label="retrieve_from_kb\\n(hybrid search)", fillcolor="#0ea5e9"];
-            summarize[label="summarize_context", fillcolor="#0ea5e9"];
         }
 
         kb    [label="Bedrock Knowledge Base\\nTitan Embeddings V2", fillcolor="#059669"];
@@ -459,7 +458,6 @@ def render_architecture_tab():
 
         ui -> agent [label="question"];
         agent -> retrieve;
-        agent -> summarize;
         retrieve -> kb -> vector;
         kb -> s3 [label="ingest", style=dashed];
         agent -> memory [label="recall / store", dir=both];
