@@ -8,7 +8,7 @@ updates:
       default-days: 7
     ignore:
       - dependency-name: "langgraph"
-        update-types: ["version-update:semver-pre-release"]
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
