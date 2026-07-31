@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PostgreSQL Snapper (PGSnapper) Setup
+
+Parameters:
+
+  VPCID:
+    Description: 'VPC ID of PostgreSQL database instance (e.g., vpc-0343606e) to be monitored'
+    Type: 'AWS::EC2::VPC::Id'
+   
+  SubnetID:
+    Description: 'VPC Subnet ID of the PostgreSQL database instance (e.g., subnet-a0246dcd) to be monitored'
+    Type: 'AWS::EC2::Subnet::Id'
+
+  DBSecurityGroupID:
+    Description: 'Security Group ID of the PostgreSQL database instance (e.g., sg-8c14mg64) to be monitored'
+    Type: AWS::EC2::SecurityGroup::Id
+    
+  InstanceType:
+    Description: PGSnapper EC2 instance type
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+    - t3.small
+    - t3.medium
+    - t3.large
+    - t3.xlarge
+    - t3.large
+    ConstraintDescription: Must be a valid EC2 instance type.
+  
+  EBSVolSize:
+    Description: PGSnapper EC2 instance EBS Volume Size in GiB
+    Type: Number
+    Default: 30
+    ConstraintDescription: 'Must be in the range 1-16,384'
+    MinValue: 1
+    MaxValue: 16384
+ 
+  DBUsername:
+    Description: Database User Name for the PostgreSQL Instance to be monitored
+    Type: String
+    MinLength: '1'
+    MaxLength: '16'
+    
+  DBUserPassword:
+    Description: Database User Password for the PostgreSQL Instance to be monitored
+    Type: String
+    MaxLength: '32'
+    MinLength: '8'
+    NoEcho: 'true'
+  
+  DBPort:
+    Description: Port for the PostgreSQL Instance to be monitored
+    Type: Number
+    ConstraintDescription: 'Must be in the range [1150-65535].'
+    MinValue: 1150
+    MaxValue: 65535
+
+Metadata:
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network configuration
+        Parameters:
+          - VPCID
+          - SubnetID
+          - DBSecurityGroupID
+      - Label:
+          default: Amazon EC2 configuration
+        Parameters:
+          - InstanceType
+          - EBSVolSize
+      - Label:
+          default: Database settings
+        Parameters:
+          - DBUsername
+          - DBUserPassword
+          - DBPort
+             
+Rules:
+
+  SubnetsInVPC:
+    Assertions:
+      - Assert:
+          'Fn::EachMemberIn':
+            - 'Fn::ValueOfAll':
+                - 'AWS::EC2::Subnet::Id'
+                - VpcId
+            - 'Fn::RefAll': 'AWS::EC2::VPC::Id'
+        AssertDescription: The subnet doesn't belong to the specified VPC
+        
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Used to describe all EC2 images."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - ec2:DescribeImages
+            Resource: "*"
+            
+  AMIInfoFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Function only retrieves the appropriate EC2 AMI image. Can be outside VPC."
+          - id: W92
+            reason: "Function is only executed once by CloudFormation Custom resource."
+    Properties:
+      Code:
+        ZipFile: |
+          // Map instance architectures to an AMI name pattern
+          var archToAMINamePattern = {
+              "PV64": "amzn-ami-pv*x86_64-ebs",
+              "HVM64": "amzn2-ami-kernel-5\.10-hvm-2\.0\.*x86_64-gp2",
+              "HVMG2": "amzn-ami-graphics-hvm*x86_64-ebs*"
+          };
+          var aws = require("aws-sdk");
+           
+          exports.handler = function(event, context) {
+           
+              console.log("REQUEST RECEIVED:\n" + JSON.stringify(event));
+              
+              // For Delete requests, immediately send a SUCCESS response.
+              if (event.RequestType == "Delete") {
+                  sendResponse(event, context, "SUCCESS");
+                  return;
+              }
+           
+              var responseStatus = "FAILED";
+              var responseData = {};
+           
+              var ec2 = new aws.EC2({region: event.ResourceProperties.Region});
+              var describeImagesParams = {
+                  Filters: [{ Name: "name", Values: [archToAMINamePattern[event.ResourceProperties.Architecture]]}],
+                  Owners: [event.ResourceProperties.Architecture == "HVMG2" ? "679593333241" : "amazon"]
+              };
+           
+              // Get AMI IDs with the specified name pattern and owner
+              ec2.describeImages(describeImagesParams, function(err, describeImagesResult) {
+                  if (err) {
+                      responseData = {Error: "DescribeImages call failed"};
+                      console.log(responseData.Error + ":\n", err);
+                  }
+                  else {
+                      var images = describeImagesResult.Images;
+                      // Sort images by name in decscending order. The names contain the AMI version, formatted as YYYY.MM.Ver.
+                      images.sort(function(x, y) { return y.Name.localeCompare(x.Name); });
+                      for (var j = 0; j < images.length; j++) {
+                          if (isBeta(images[j].Name)) continue;
+                          responseStatus = "SUCCESS";
+                          responseData["Id"] = images[j].ImageId;
+                          break;
+                      }
+                  }
+                  sendResponse(event, context, responseStatus, responseData);
+              });
+          };
+          
+          // Check if the image is a beta or rc image. The Lambda function won't return any of those images.
+          function isBeta(imageName) {
+              return imageName.toLowerCase().indexOf("beta") > -1 || imageName.toLowerCase().indexOf(".rc") > -1;
+          }
+          
+          
+          // Send response to the pre-signed S3 URL 
+          function sendResponse(event, context, responseStatus, responseData) {
+           
+              var responseBody = JSON.stringify({
+                  Status: responseStatus,
+                  Reason: "See the details in CloudWatch Log Stream: " + context.logStreamName,
+                  PhysicalResourceId: context.logStreamName,
+                  StackId: event.StackId,
+                  RequestId: event.RequestId,
+                  LogicalResourceId: event.LogicalResourceId,
+                  Data: responseData
+              });
+           
+              console.log("RESPONSE BODY:\n", responseBody);
+           
+              var https = require("https");
+              var url = require("url");
+           
+              var parsedUrl = url.parse(event.ResponseURL);
+              var options = {
+                  hostname: parsedUrl.hostname,
+                  port: 443,
+                  path: parsedUrl.path,
+                  method: "PUT",
+                  headers: {
+                      "content-type": "",
+                      "content-length": responseBody.length
+                  }
+              };
+           
+              console.log("SENDING RESPONSE...\n");
+           
+              var request = https.request(options, function(response) {
+                  console.log("STATUS: " + response.statusCode);
+                  console.log("HEADERS: " + JSON.stringify(response.headers));
+                  // Tell AWS Lambda that the function execution is done  
+                  context.done();
+              });
+           
+              request.on("error", function(error) {
+                  console.log("sendResponse Error:" + error);
+                  // Tell AWS Lambda that the function execution is done  
+                  context.done();
+              });
+            
+              // write data to request body
+              request.write(responseBody);
+              request.end();
+          }   
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs16.x
+      Timeout: '30'
+
+  AMIInfo:
+    Type: Custom::AMIInfo
+    Properties:
+      ServiceToken: !GetAtt AMIInfoFunction.Arn
+      Region: !Ref AWS::Region
+      Architecture: HVM64
+      
+  PGSnapperSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: "Using Default AWS managed key aws/secretsmanager"
+    Properties:
+      Name: !Join ['/', ['PGSnapper', !Ref 'AWS::StackName']]
+      Description: !Join ['', ['PGSnapper PostgreSQL Database User Secret ', 'for CloudFormation Stack ', !Ref 'AWS::StackName']]
+      Tags:
+        -
+          Key: StackID
+          Value: !Ref 'AWS::StackId'
+      SecretString: !Sub '{ "username" : "${DBUsername}", "password" : "${DBUserPassword}" }'
+ 
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: "Access is controlled by IAM user policy created below."
+          - id: W35
+            reason: "Bucket is used temporarily to share PGSnapper output using S3 presigned URL"
+          - id: W41
+            reason: "Bucket is used temporarily to share PGSnapper output using S3 presigned URL"
+    Properties:
+      Tags:
+        - Key: Application
+          Value: !Sub "PGSnapper https://github.com/aws-samples/aurora-and-database-migration-labs/tree/master/Code/PGPerfStatsSnapper"
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref PGSnapperSecret
+                Effect: Allow
+          PolicyName: secret-access-policy
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 's3:ListBucket'
+                Resource: !GetAtt S3Bucket.Arn
+                Effect: Allow
+              - Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:DeleteObject'
+                Resource: !Join [ '/' , [ !GetAtt S3Bucket.Arn, '*']]
+                Effect: Allow  
+          PolicyName: s3-access-policy
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - !Sub 'ec2.${AWS::URLSuffix}'
+                - 'ssm.amazonaws.com'
+            Effect: Allow
+        Version: 2012-10-17
+
+  ProfileEC2Host:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles: 
+        - !Ref EC2Role
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W40
+            reason: "Default egress rule"
+          - id: W5
+            reason: "Default egress rule"
+    Properties:
+      GroupDescription: PGSnapper EC2 host security group
+      VpcId: !Ref VPCID
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          Description: Default outbound access for security group
+  
+  DBSecurityGroupIngress:
+    Properties:
+      GroupId: !Ref DBSecurityGroupID
+      IpProtocol: tcp
+      FromPort: !Ref DBPort
+      ToPort: !Ref DBPort
+      SourceSecurityGroupId: !Ref Ec2SecurityGroup
+      Description: 'PGSnapper EC2 host access'
+    Type: 'AWS::EC2::SecurityGroupIngress'
+      
+  SnapperInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Properties:
+      InstanceType:
+        Ref: InstanceType
+      ImageId:
+        Fn::GetAtt:
+        - AMIInfo
+        - Id
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref EBSVolSize
+            VolumeType: gp3
+      SubnetId: !Ref SubnetID
+      SecurityGroupIds: [ !Ref Ec2SecurityGroup ]
+      IamInstanceProfile: !Ref ProfileEC2Host
+      Tags:
+        - Key: Name
+          Value: !Sub "PGSnapper-${AWS::StackName}"
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - "\n"
+            - - !Sub |
+                #!/bin/bash
+                cd /tmp
+      
+                # start bootstrap
+                echo "$(date "+%F %T") * running as $(whoami)" >> /debug.log
+      
+                # Start SSM & upgrade packages
+                echo "$(date "+%F %T") * Starting SSM agent" >> /debug.log
+                sudo systemctl enable amazon-ssm-agent
+                sudo systemctl start amazon-ssm-agent
+                echo "$(date "+%F %T") * Finished starting SSM agent" >> /debug.log
+                source ~/.bashrc
+                echo "$(date "+%F %T") * Updating packages to the latest version" >> /debug.log
+                sudo yum update -y >> /debug.log
+                echo "$(date "+%F %T") * Finished updating packages to the latest version" >> /debug.log
+                
+                # Install PG client
+                echo "$(date "+%F %T") * Installing PG client" >> /debug.log           
+                sudo yum -y group install "Development Tools" >> /debug.log
+                sudo yum -y install readline-devel >> /debug.log
+                sudo yum -y install openssl-devel >> /debug.log
+                mkdir /home/ec2-user/postgresql
+                cd /home/ec2-user/postgresql
+                curl https://ftp.postgresql.org/pub/source/v13.7/postgresql-13.7.tar.gz -o postgresql-13.7.tar.gz >> /debug.log
+                tar -xvf postgresql-13.7.tar.gz
+                cd postgresql-13.7
+                sudo ./configure --with-openssl >> /debug.log
+                sudo make -C src/bin install >> /debug.log
+                sudo make -C src/include install >> /debug.log
+                sudo make -C src/interfaces install >> /debug.log
+                sudo make -C doc install >> /debug.log
+                sudo /sbin/ldconfig /usr/local/pgsql/lib >> /debug.log
+                echo "$(date "+%F %T") * Finished installing PG client" >> /debug.log           
+                
+                # Install required Python packages
+                echo "$(date "+%F %T") * Installing Python packages" >> /debug.log           
+                sudo yum -y install python3 python3-pip python3-devel >> /debug.log
+                PATH=/usr/local/pgsql/bin:$PATH
+                export PATH
+                pip3 install boto3 >> /debug.log 
+                pip3 install PyGreSQL >> /debug.log
+                echo "$(date "+%F %T") * Finished installing Python packages" >> /debug.log           
+                
+                # Install required Python packages
+                echo "$(date "+%F %T") * Downloading PGSnapper scripts" >> /debug.log           
+                mkdir -p /home/ec2-user/scripts
+                cd /home/ec2-user/scripts
+                curl -L https://raw.githubusercontent.com/aws-samples/aurora-and-database-migration-labs/master/Code/PGPerfStatsSnapper/pg_perf_stat_snapper.py -o pg_perf_stat_snapper.py
+                curl -L https://raw.githubusercontent.com/aws-samples/aurora-and-database-migration-labs/master/Code/PGPerfStatsSnapper/pg_perf_stat_loader.py -o pg_perf_stat_loader.py
+                curl -L https://raw.githubusercontent.com/aws-samples/aurora-and-database-migration-labs/master/Code/PGPerfStatsSnapper/config_pg_perf_stat_snapper.json -o config_pg_perf_stat_snapper.json
+                chown -R ec2-user:ec2-user /home/ec2-user/scripts
+                chmod 755 pg_perf_stat_snapper.py
+                chmod 755 pg_perf_stat_loader.py
+                echo "$(date "+%F %T") * Finished downloading PGSnapper scripts" >> /debug.log
+                
+                echo "$(date "+%F %T") * Updating /home/ec2-user/.bash_profile with required env variables" >> /debug.log
+                echo "export PATH=\$PATH:/usr/local/pgsql/bin/" >> /home/ec2-user/.bash_profile
+                echo "export LD_LIBRARY_PATH=/usr/local/pgsql/lib" >> /home/ec2-user/.bash_profile
+                echo "$(date "+%F %T") * Finished updating /home/ec2-user/.bash_profile" >> /debug.log
+                
+                echo "$(date "+%F %T") * Sending cfn signal" >> /debug.log
+                /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource SnapperInstance --region ${AWS::Region}
+                
+Outputs:
+
+  PGSnapperEC2InstAMIID:
+    Description: PGSnapper EC2 instance AMI ID
+    Value: !GetAtt AMIInfo.Id
+   
+  PGSnapperEC2InstID:
+    Description: EC2 Instance ID for PGSnapper
+    Value: !Ref SnapperInstance
+    
+  PGSnapperSecretARN:
+    Description: Database User Secret ARN for the PostgreSQL Instance to be monitored
+    Value: !Ref PGSnapperSecret
+    
+  PGSnapperS3Bucket:
+    Description: S3 bucket to store PGSnapper output for sharing
+    Value: !Join ['', ['s3://', !Ref S3Bucket, '/']] 
+  

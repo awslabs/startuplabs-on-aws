@@ -1,0 +1,714 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Customer data collection deployment for GenAI WAL Review - fleet discovery and data collection only'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: EC2 instance type (t3.medium sufficient for data collection only)
+  
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: >
+      EC2 Key Pair name for SSH access. Optional when using --no-public-ip
+      (SSM Session Manager access only — no SSH needed).
+      Required when AssignPublicIP is true.
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the instance will be launched
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID where the instance will be launched (public subnet recommended)
+
+  DBPort:
+    Type: Number
+    Default: 5432
+    Description: PostgreSQL port on the target RDS/Aurora endpoint (used for invasive collection egress rule)
+    AllowedValues: [5432, 5433, 5434, 5435, 5436, 5437, 5438, 5439, 5440]
+    ConstraintDescription: Must be a valid PostgreSQL port (5432-5440)
+  
+  AllowedCIDR:
+    Type: String
+    Default: '127.0.0.1/32'
+    Description: >
+      CIDR block allowed for SSH access (0.0.0.0/0 not permitted).
+      Not required when using --no-public-ip (defaults to 127.0.0.1/32 as a no-op placeholder).
+    AllowedPattern: ^(?!0\.0\.0\.0/0$)([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$
+    ConstraintDescription: Must be a valid IP CIDR range (x.x.x.x/x). 0.0.0.0/0 is not allowed for SSH access.
+  
+  SADataBucket:
+    Type: String
+    Description: S3 bucket name for sharing data with SA (will be created if doesn't exist)
+    Default: ''
+
+  ResolvedDataBucketName:
+    Type: String
+    Description: Resolved S3 bucket name (set by deploy script - either SADataBucket or auto-generated name)
+    Default: ''
+  
+  EnableScheduledCollection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable scheduled data collection
+  
+  CollectionSchedule:
+    Type: String
+    Default: '0 6 * * *'
+    Description: 'Cron schedule for data collection (default - daily at 6 AM)'
+  
+  CodeSourceBucket:
+    Type: String
+    Description: S3 bucket containing application code (fallback if git clone fails)
+    Default: ''
+  
+  CodeSourceKey:
+    Type: String
+    Description: S3 key for application code zip file
+    Default: 'wal-db-stats-collection.zip'
+
+  AssignPublicIP:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Assign a public IP to the EC2 instance. Set to false for private subnet + SSM access (recommended).
+
+  CreateSSMEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Create VPC Interface Endpoints for SSM, SSMMessages, and EC2Messages.
+      Only required when using --no-public-ip in a VPC that does not already have
+      these endpoints. Set to true to create them; set to false (default) if they
+      already exist — the deploy script will reuse them automatically.
+      Cost: ~$0.03/hour ($0.01 per endpoint per AZ) while the stack exists.
+
+  InstallMode:
+    Type: String
+    Default: 'online'
+    AllowedValues: ['online', 'airgapped']
+    Description: >
+      online (default): EC2 clones code from GitHub and installs Python packages
+      from PyPI during bootstrap. Requires outbound internet access (IGW or NAT).
+      airgapped: EC2 installs from a pre-bundled vendor.zip uploaded to S3.
+      No internet access required — all packages and PGSnapper are included.
+      Use with --no-public-ip in subnets with no NAT Gateway or IGW.
+
+Conditions:
+  HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
+  NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
+  HasCodeSourceBucket: !Not [!Equals [!Ref CodeSourceBucket, '']]
+  IsPublicIP: !Equals [!Ref AssignPublicIP, 'true']
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  IsAirgapped: !Equals [!Ref InstallMode, 'airgapped']
+  NeedSSMEndpoints: !And
+    - !Equals [!Ref AssignPublicIP, 'false']
+    - !Equals [!Ref CreateSSMEndpoints, 'true']
+
+Resources:
+  # S3 Bucket for data sharing with SA
+  CustomerDataBucket:
+    Type: AWS::S3::Bucket
+    Condition: NeedToCreateBucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CustomerDataAccessLogBucket
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Application
+          Value: WAL-DB-Stats-Collection
+
+  # Separate bucket for S3 access logs (access logging cannot target itself)
+  CustomerDataAccessLogBucket:
+    Type: AWS::S3::Bucket
+    Condition: NeedToCreateBucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-access-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  CustomerDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: NeedToCreateBucket
+    Properties:
+      Bucket: !Ref CustomerDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CustomerDataBucket.Arn
+              - !Sub '${CustomerDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # IAM Role for data collection only (no Bedrock permissions)
+  CustomerDataCollectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-DataCollectionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CustomerDataCollectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # RDS and Aurora permissions for fleet discovery
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusterParameters
+                  - rds:DescribeDBParameters
+                  - rds:DescribeDBSubnetGroups
+                  - rds:DescribeDBClusterParameterGroups
+                  - rds:DescribeDBParameterGroups
+                  - rds:ListTagsForResource
+                Resource: '*'
+              
+              # CloudWatch and Performance Insights for data collection
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricData
+                  - pi:GetResourceMetrics
+                  - pi:DescribeDimensionKeys
+                  - pi:GetDimensionKeyDetails
+                  - pi:ListAvailableResourceDimensions
+                  - pi:ListAvailableResourceMetrics
+                Resource: '*'
+              
+              # S3 permissions for data sharing
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
+              
+              # Secrets Manager permissions for PGSnapper
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: '*'
+              
+              # S3 permissions for code source bucket (if provided)
+              - !If
+                - HasCodeSourceBucket
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CodeSourceBucket}/${CodeSourceKey}'
+                - !Ref 'AWS::NoValue'
+              
+              # EC2 permissions for fleet discovery
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:DescribeAvailabilityZones
+                Resource: '*'
+              
+              # Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  CustomerDataCollectionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-DataCollectionInstanceProfile'
+      Roles:
+        - !Ref CustomerDataCollectionRole
+
+  # Security Group for data collection
+  CustomerDataCollectionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-DataCollectionSG'
+      GroupDescription: Security group for Customer Data Collection EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - !If
+          - IsPublicIP
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AllowedCIDR
+            Description: SSH access
+          - !Ref 'AWS::NoValue'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS APIs, S3, package repos, GitHub, CloudWatch agent, cfn-signal
+        - IpProtocol: tcp
+          FromPort: !Ref DBPort
+          ToPort: !Ref DBPort
+          CidrIp: 0.0.0.0/0
+          Description: PostgreSQL access to customer RDS/Aurora endpoints (invasive collection)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DataCollectionSG'
+
+  # EC2 Instance for data collection only
+  CustomerDataCollectionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      IamInstanceProfile: !Ref CustomerDataCollectionInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref CustomerDataCollectionSecurityGroup
+          AssociatePublicIpAddress: !If [IsPublicIP, true, false]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # Update system and install packages
+          # In airgapped mode, skip dnf update (no internet) but install local RPMs if available
+          if [ "${InstallMode}" = "airgapped" ]; then
+            echo "[INFO] Air-gapped mode: installing base packages from local repos only..."
+            dnf install -y python3.11 python3.11-pip python3-devel python3-pip postgresql15 postgresql15-contrib postgresql15-server postgresql15-server-devel gcc htop cronie cronie-anacron bc 2>/dev/null || \
+            dnf install -y python3.11 python3.11-pip postgresql15 postgresql15-server gcc cronie 2>/dev/null || true
+          else
+            dnf update -y
+            dnf install -y git python3.11 python3.11-pip python3-devel python3-pip postgresql15 postgresql15-contrib postgresql15-server postgresql15-server-devel gcc htop cronie cronie-anacron bc
+          fi
+          
+          # DO NOT use alternatives - it breaks dnf/yum which depend on python3.9
+          # Keep python3 = python3.9 (system default)
+          # Use python3.11 explicitly for application code
+          
+          echo "System python3 (for dnf/yum): $(python3 --version)"
+          echo "Application python3.11: $(python3.11 --version)"
+          
+          # Create aliases for convenience (but don't override system python3)
+          echo 'alias python="python3.11"' >> /home/ec2-user/.bashrc
+          echo 'alias pip="python3.11 -m pip"' >> /home/ec2-user/.bashrc
+          
+          # Remove any existing virtual environments
+          sudo -u ec2-user rm -rf /home/ec2-user/wal-db-stats-collection/venv
+          
+          # Create application directory
+          sudo -u ec2-user mkdir -p /home/ec2-user/wal-db-stats-collection
+          cd /home/ec2-user/wal-db-stats-collection
+
+          # ── Code setup: online vs airgapped ──────────────────────────────────
+          if [ "${InstallMode}" = "airgapped" ]; then
+            echo "[INFO] Air-gapped mode: downloading vendor bundle from S3..."
+            aws s3 cp "s3://${CodeSourceBucket}/vendor.zip" /tmp/vendor.zip --region ${AWS::Region} || {
+              echo "[ERROR] Failed to download vendor.zip from S3 — ensure --airgapped was used with deploy script"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            mkdir -p /opt/vendor
+            unzip -q /tmp/vendor.zip -d /opt/vendor_extract
+            cp -r /opt/vendor_extract/vendor-bundle/* /opt/vendor/
+            rm -f /tmp/vendor.zip
+
+            echo "[INFO] Air-gapped mode: downloading application code from S3..."
+            aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip --region ${AWS::Region} || {
+              echo "[ERROR] Failed to download application code from S3"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
+              echo "[ERROR] Code extraction failed"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            rm /tmp/wal-db-stats-collection.zip
+            echo "[OK] Code extracted from S3"
+
+            echo "[INFO] Air-gapped mode: running offline install..."
+            bash /opt/vendor/install.sh || {
+              echo "[ERROR] Offline install failed"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            echo "[OK] Vendor packages installed offline"
+          else
+            # Try git clone first, fallback to S3
+            echo "[INFO] Attempting to clone repository..."
+            if sudo -u ec2-user git clone https://github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection.git . 2>/dev/null; then
+              echo "[OK] Code cloned from GitHub"
+            elif [ ! -z "${CodeSourceBucket}" ]; then
+              echo "[INFO] Git clone failed, downloading from S3..."
+              aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip || {
+                echo "[ERROR] Both git clone and S3 download failed - deployment cannot continue"
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                exit 1
+              }
+              sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
+                echo "[ERROR] Code extraction failed - deployment cannot continue"
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                exit 1
+              }
+              rm /tmp/wal-db-stats-collection.zip
+              echo "[OK] Code downloaded from S3"
+            else
+              echo "[ERROR] Both git clone and S3 download failed - no code source available"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            fi
+          fi
+          # ─────────────────────────────────────────────────────────────────────
+          
+          # Validate required files are present
+          MISSING=""
+          for f in scripts/non_invasive_collector.py scripts/invasive_collector.py utils/fleet_discovery.py utils/pii_redactor.py deployment/collect-and-share.sh requirements.txt; do
+            [ ! -f "$f" ] && MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "[ERROR] Deployment package incomplete — missing:$MISSING"
+            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+            exit 1
+          fi
+          
+          # Install Python packages for python3.11 (application code)
+          # Skipped in airgapped mode — already installed by vendor/install.sh
+          if [ "${InstallMode}" != "airgapped" ]; then
+            python3.11 -m pip install --upgrade pip
+            python3.11 -m pip install -r requirements.txt || {
+              echo "[ERROR] Requirements installation failed - deployment cannot continue"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+          fi
+          
+          # Setup local PostgreSQL for PGPerfStatsSnapper
+          echo "[INFO] Setting up PostgreSQL..."
+          
+          # Initialize PostgreSQL database
+          postgresql-setup --initdb
+          
+          # Configure PostgreSQL to use trust authentication for local connections
+          sed -i 's/^local.*all.*all.*peer$/local   all             all                                     trust/' /var/lib/pgsql/data/pg_hba.conf
+          sed -i 's/^host.*all.*all.*127.0.0.1\/32.*ident$/host    all             all             127.0.0.1\/32            trust/' /var/lib/pgsql/data/pg_hba.conf
+          
+          # Start and enable PostgreSQL service
+          systemctl start postgresql
+          systemctl enable postgresql
+          
+          # Start and enable cron service
+          systemctl start crond
+          systemctl enable crond
+          
+          # Check PostgreSQL status
+          systemctl status postgresql --no-pager
+          
+          # Setup PGPerfStatsSnapper
+          sudo -u ec2-user mkdir -p /home/ec2-user/pgperfstats
+          cd /home/ec2-user/pgperfstats
+          sudo -u ec2-user git clone https://github.com/aws-samples/aurora-and-database-migration-labs.git . || echo "Repository already exists"
+          
+          # Install PGSnapper dependencies for python3.9 (PGSnapper uses #!/usr/bin/python3)
+          python3 -m pip install --upgrade pip
+          python3 -m pip install boto3 psycopg2-binary PyGreSQL
+          
+          # Also install for python3.11 for consistency
+          python3.11 -m pip install boto3 psycopg2-binary
+
+          # Download RDS global certificate bundle for SSL connections
+          mkdir -p /certs
+          curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /certs/global-bundle.pem
+          chmod 644 /certs/global-bundle.pem
+
+          # Create symlinks for PGSnapper (expects psql at /usr/local/pgsql/bin/)
+          mkdir -p /usr/local/pgsql/bin
+          ln -sf /usr/bin/psql /usr/local/pgsql/bin/psql
+          ln -sf /usr/bin/pg_dump /usr/local/pgsql/bin/pg_dump
+          
+          # Fixed SQL queries are already in the repo at scripts/pgsnapper_sql_fixes/
+          # No need to copy - the invasive_collector.py script will use them directly
+          
+          # Fix permissions for PGSnapper directories (skip .rpm file if it fails)
+          chmod -R 755 /home/ec2-user/pgperfstats/Code/ 2>/dev/null || true
+          chmod -R 755 /home/ec2-user/pgperfstats/output/ 2>/dev/null || true
+          
+          # Make SQL files readable by postgres user for analysis queries
+          chmod -R a+rX /home/ec2-user/pgperfstats 2>/dev/null || true
+          
+          # Allow postgres user to traverse /home/ec2-user to access SQL files
+          chmod 755 /home/ec2-user
+          
+          # Add PostgreSQL bin to PATH for PGSnapper
+          echo 'export PATH=/usr/pgsql-15/bin:$PATH' >> /home/ec2-user/.bashrc
+          echo 'export LD_LIBRARY_PATH=/usr/pgsql-15/lib' >> /home/ec2-user/.bashrc
+          
+          # Set environment variables for data collection
+          cat >> /home/ec2-user/.bashrc << 'EOF'
+          export AWS_REGION=${AWS::Region}
+          export CUSTOMER_DATA_BUCKET="${ResolvedDataBucketName}"
+          export DATA_COLLECTION_MODE=true
+          export AWS_KNOWLEDGE_MCP_REMOTE_URL="https://knowledge-mcp.global.api.aws"
+          export PGPERFSTATS_DIR="/home/ec2-user/pgperfstats"
+          
+          # Change to project directory on login
+          cd /home/ec2-user/wal-db-stats-collection
+          EOF
+          
+          # Scripts are now packaged in the zip (deployment/collect-and-share.sh, deployment/enable-invasive-collection.sh)
+          # Write config file with deployment-specific values (region, bucket)
+          cat > /home/ec2-user/wal-db-stats-collection/deployment/collection.conf << 'CONF'
+          AWS_REGION=${AWS::Region}
+          CUSTOMER_DATA_BUCKET=${ResolvedDataBucketName}
+          DATA_DIR=/home/ec2-user/wal-db-stats-collection/data
+          CONF
+          sed -i 's/^[[:space:]]*//' /home/ec2-user/wal-db-stats-collection/deployment/collection.conf
+          
+          # Symlink scripts to project root for easy access
+          ln -sf /home/ec2-user/wal-db-stats-collection/deployment/collect-and-share.sh                  /home/ec2-user/wal-db-stats-collection/collect-and-share.sh
+          ln -sf /home/ec2-user/wal-db-stats-collection/deployment/enable-invasive-collection.sh                  /home/ec2-user/wal-db-stats-collection/enable-invasive-collection.sh
+          chmod +x /home/ec2-user/wal-db-stats-collection/deployment/collect-and-share.sh
+          chmod +x /home/ec2-user/wal-db-stats-collection/deployment/enable-invasive-collection.sh
+          
+          # Set up scheduled data collection if enabled
+          if [ "${EnableScheduledCollection}" = "true" ]; then
+            sudo -u ec2-user crontab -l 2>/dev/null | { cat; echo "${CollectionSchedule} cd /home/ec2-user/wal-db-stats-collection && ./collect-and-share.sh >> /home/ec2-user/wal-db-stats-collection/logs/cron.log 2>&1"; } | sudo -u ec2-user crontab -
+          fi
+          
+          # Create systemd service for on-demand collection
+          cat > /etc/systemd/system/db-stats-collection.service << 'EOF'
+          [Unit]
+          Description=Customer Data Collection Service
+          After=network.target
+          
+          [Service]
+          Type=oneshot
+          User=ec2-user
+          WorkingDirectory=/home/ec2-user/wal-db-stats-collection
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          Environment=AWS_REGION=${AWS::Region}
+          Environment=CUSTOMER_DATA_BUCKET=${ResolvedDataBucketName}
+          ExecStart=/home/ec2-user/wal-db-stats-collection/collect-and-share.sh
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          systemctl enable db-stats-collection
+          
+          # Install CloudWatch agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+          
+          # Remove wrapper scripts (no longer needed)
+          # Set permissions
+          chown -R ec2-user:ec2-user /home/ec2-user/wal-db-stats-collection
+          
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DataCollection'
+        - Key: Application
+          Value: WAL-DB-Stats-Collection
+        - Key: Environment
+          Value: Production
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+
+  # CloudWatch Log Group
+  CustomerDataCollectionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/db-stats-collection/${AWS::StackName}'
+      RetentionInDays: 30
+      # W84/CKV_AWS_158: KMS encryption omitted intentionally — this log group contains
+      # only EC2 UserData bootstrap output (package installs, git clone status).
+      # No sensitive data is written here. Adding a CMK would require customers to
+      # pre-create a KMS key and grant CloudWatch Logs access, adding deployment
+      # complexity disproportionate to the risk for a short-lived (30-day) bootstrap log.
+
+  # ── VPC Interface Endpoints for SSM Session Manager (--no-public-ip mode) ──
+  # Created only when AssignPublicIP=false AND CreateSSMEndpoints=true.
+  # Skip if the VPC already has these endpoints — the deploy script reuses them.
+  # Allow instance to reach VPC endpoints on TCP/443 (self-referencing rule)
+  # Only needed when CFN creates the endpoints (Pattern B) — endpoint SG = instance SG
+  SSMEndpointIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NeedSSMEndpoints
+    Properties:
+      GroupId: !Ref CustomerDataCollectionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
+      Description: Allow SSM agent to reach VPC endpoints (self-referencing for Pattern B)
+
+  SSMInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SSMMessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  EC2MessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+Outputs:
+  InstanceId:
+    Description: Instance ID of the Customer Data Collection EC2 instance
+    Value: !Ref CustomerDataCollectionInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstanceSecurityGroup:
+    Description: Security group ID of the EC2 instance (needed to configure pre-existing SSM VPC endpoints)
+    Value: !Ref CustomerDataCollectionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceSecurityGroup'
+  
+  PublicIP:
+    Description: Public IP address of the Customer Data Collection EC2 instance (empty when --no-public-ip)
+    Value: !If
+      - IsPublicIP
+      - !GetAtt CustomerDataCollectionInstance.PublicIp
+      - 'N/A - Private subnet deployment (use SSM)'
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIP'
+  
+  PrivateIP:
+    Description: Private IP address of the Customer Data Collection EC2 instance
+    Value: !GetAtt CustomerDataCollectionInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+  
+  CustomerDataBucket:
+    Description: S3 bucket for sharing data with SA
+    Value: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataBucket'
+  
+  SSHCommand:
+    Description: Command to connect to the instance
+    Value: !If
+      - IsPublicIP
+      - !Sub
+        - 'ssh -i ${KP}.pem ec2-user@${IP}'
+        - KP: !Ref KeyPairName
+          IP: !GetAtt CustomerDataCollectionInstance.PublicIp
+      - !Sub 'aws ssm start-session --target ${CustomerDataCollectionInstance} --region ${AWS::Region}'
+  
+  DataCollectionCommand:
+    Description: Command to run data collection and sharing
+    Value: './collect-and-share.sh'
+  
+  InvasiveCollectionCommand:
+    Description: Command to enable invasive data collection with PGPerfStatsSnapper
+    Value: './enable-invasive-collection.sh <cluster-id> <db-host> <db-user> <db-secret-arn> [db-name] [pgsnapper-min-days] [pgsnapper-interval] [skip-pg-stat-statements]'
+  
+  ServiceCommand:
+    Description: Command to run data collection as a service
+    Value: 'sudo systemctl start db-stats-collection'
+  
+  ScheduledCollection:
+    Description: Scheduled data collection configuration
+    Value: !Sub 'Enabled: ${EnableScheduledCollection}, Schedule: ${CollectionSchedule}'
+  
+  SAInstructions:
+    Description: S3 location of collected DB stats
+    Value: !Sub 'Collected DB stats available at: s3://${ResolvedDataBucketName}/db-stats/'
