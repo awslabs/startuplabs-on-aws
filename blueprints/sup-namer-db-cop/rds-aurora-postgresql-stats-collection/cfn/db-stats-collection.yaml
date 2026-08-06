@@ -521,18 +521,13 @@ Resources:
           $PY -m pip install boto3 psycopg2-binary 2>/dev/null || true
 
           # Download RDS global certificate bundle for SSL connections
-          # In airgapped mode, include the cert in the vendor bundle or skip (SSL will fail at runtime)
           mkdir -p /certs
           if [ "${InstallMode}" = "airgapped" ]; then
-            # Try to get cert from vendor bundle if included, otherwise create a placeholder
-            if [ -f /opt/vendor/global-bundle.pem ]; then
-              cp /opt/vendor/global-bundle.pem /certs/global-bundle.pem
+            # Use cert from vendor bundle (included at /opt/vendor/global-bundle.pem by install.sh)
+            if [ -f /certs/global-bundle.pem ]; then
               echo "[INFO] SSL cert loaded from vendor bundle"
             else
-              # Download via S3 endpoint if available, otherwise skip
-              aws s3 cp s3://rds-downloads/rds-combined-ca-bundle.pem /certs/global-bundle.pem \
-                --region ${AWS::Region} 2>/dev/null || \
-              echo "[WARN] SSL cert not available in airgapped mode — invasive collection may fail"
+              echo "[WARN] SSL cert not found — invasive collection will fail"
             fi
           else
             curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \

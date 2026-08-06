@@ -32,4 +32,11 @@ mkdir -p /home/ec2-user/pgperfstats/Code
 cp -r "$VENDOR_DIR/pgsnapper/PGPerfStatsSnapper" /home/ec2-user/pgperfstats/Code/
 chown -R ec2-user:ec2-user /home/ec2-user/pgperfstats
 echo "PGSnapper installed to /home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper"
+# Copy RDS SSL certificate (required for invasive collection with sslmode=verify-full)
+if [ -f "$VENDOR_DIR/global-bundle.pem" ]; then
+    mkdir -p /certs
+    cp "$VENDOR_DIR/global-bundle.pem" /certs/global-bundle.pem
+    chmod 644 /certs/global-bundle.pem
+    echo "SSL cert installed from vendor bundle"
+fi
 echo "=== Offline install complete ==="
