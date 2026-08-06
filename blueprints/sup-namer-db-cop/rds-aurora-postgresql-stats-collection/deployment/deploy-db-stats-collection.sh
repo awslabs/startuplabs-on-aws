@@ -61,6 +61,10 @@ while [[ $# -gt 0 ]]; do
             AIRGAPPED="true"
             shift
             ;;
+        --route-table-ids)
+            ROUTE_TABLE_IDS="$2"
+            shift 2
+            ;;
         --sa-data-bucket)
             SA_DATA_BUCKET="$2"
             shift 2
@@ -163,59 +167,18 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
     echo "🔍 Checking network prerequisites for --no-public-ip mode..."
 
     if [[ "${AIRGAPPED:-false}" == "true" ]]; then
-        # Air-gapped mode: no NAT required — EC2 uses VPC endpoints only
-        # Validate that required VPC endpoints exist (or will be created)
-        echo "   🔒 Air-gapped mode: checking required VPC endpoints..."
-        REQUIRED_ENDPOINTS="s3 ssm ssmmessages ec2messages rds monitoring secretsmanager"
-        MISSING_ENDPOINTS=""
-        for SVC in $REQUIRED_ENDPOINTS; do
-            EP=$(aws ec2 describe-vpc-endpoints \
+        # Air-gapped mode: VPC endpoints are created by CFN (NeedAirgappedEndpoints condition)
+        # No pre-flight endpoint checks needed here — CFN manages them
+        echo "   🔒 Air-gapped mode: VPC endpoints will be created by CloudFormation"
+        echo "      (s3, ssm, ssmmessages, ec2messages, rds, monitoring, pi, cloudformation, secretsmanager)"
+        # Auto-discover route table for S3 Gateway endpoint if not provided
+        if [ -z "$ROUTE_TABLE_IDS" ]; then
+            ROUTE_TABLE_IDS=$(aws ec2 describe-route-tables \
+                --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
                 --region "$REGION" \
-                --filters "Name=service-name,Values=com.amazonaws.${REGION}.${SVC}" \
-                          "Name=vpc-id,Values=${VPC_ID}" \
-                          "Name=vpc-endpoint-state,Values=available" \
-                --query 'VpcEndpoints[0].VpcEndpointId' --output text 2>/dev/null || true)
-            if [ -z "$EP" ] || [ "$EP" = "None" ]; then
-                MISSING_ENDPOINTS="$MISSING_ENDPOINTS $SVC"
-            else
-                echo "   ✅ $SVC endpoint: $EP"
-            fi
-        done
-        if [ -n "$MISSING_ENDPOINTS" ]; then
-            echo ""
-            echo "⚠️  Missing VPC endpoints for air-gapped mode:$MISSING_ENDPOINTS"
-            echo "   Creating missing endpoints..."
-            for SVC in $MISSING_ENDPOINTS; do
-                EP_TYPE="Interface"
-                [ "$SVC" = "s3" ] && EP_TYPE="Gateway"
-                if [ "$EP_TYPE" = "Gateway" ]; then
-                    # Get main route table for the subnet
-                    RT=$(aws ec2 describe-route-tables \
-                        --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
-                        --region "$REGION" \
-                        --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || true)
-                    aws ec2 create-vpc-endpoint \
-                        --vpc-id "$VPC_ID" \
-                        --vpc-endpoint-type Gateway \
-                        --service-name "com.amazonaws.${REGION}.${SVC}" \
-                        --route-table-ids "$RT" \
-                        --region "$REGION" > /dev/null \
-                        && echo "   ✅ Created $SVC (Gateway) endpoint" \
-                        || echo "   ⚠️  Could not create $SVC endpoint"
-                else
-                    aws ec2 create-vpc-endpoint \
-                        --vpc-id "$VPC_ID" \
-                        --vpc-endpoint-type Interface \
-                        --service-name "com.amazonaws.${REGION}.${SVC}" \
-                        --subnet-ids "$SUBNET_ID" \
-                        --private-dns-enabled \
-                        --region "$REGION" > /dev/null \
-                        && echo "   ✅ Created $SVC (Interface) endpoint" \
-                        || echo "   ⚠️  Could not create $SVC endpoint"
-                fi
-            done
+                --query 'RouteTables[*].RouteTableId' --output text 2>/dev/null | tr '\t' ',')
+            echo "   Auto-detected route table(s): $ROUTE_TABLE_IDS"
         fi
-        echo "   VPC endpoint check complete."
     else
         HAS_NAT=$(aws ec2 describe-route-tables \
             --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
@@ -318,17 +281,26 @@ aws s3api put-bucket-encryption \
 
 aws s3 cp "$ZIP_PATH" "s3://$CODE_BUCKET/$CODE_KEY" --region "$REGION"
 
-# Air-gapped mode: also upload vendor bundle (pre-downloaded wheels + PGSnapper)
+# Air-gapped mode: build vendor.zip on-the-fly from vendor/ directory and upload
 if [[ "${AIRGAPPED:-false}" == "true" ]]; then
-    VENDOR_ZIP="$REPO_ROOT/vendor/vendor.zip"
-    if [ ! -f "$VENDOR_ZIP" ]; then
-        echo "❌ vendor/vendor.zip not found. Required for --airgapped mode."
-        echo "   Expected at: $VENDOR_ZIP"
+    VENDOR_DIR="$REPO_ROOT/vendor"
+    if [ ! -d "$VENDOR_DIR/wheels" ] || [ ! -d "$VENDOR_DIR/pgsnapper" ]; then
+        echo "❌ vendor/wheels/ or vendor/pgsnapper/ not found. Required for --airgapped mode."
+        echo "   Expected at: $VENDOR_DIR"
         exit 1
     fi
+    VENDOR_ZIP="/tmp/vendor-$STACK_NAME.zip"
+    echo "📦 Building vendor bundle from vendor/ directory..."
+    (cd "$REPO_ROOT" && zip -r "$VENDOR_ZIP" \
+        vendor/wheels \
+        vendor/pgsnapper \
+        vendor/install.sh \
+        vendor/requirements.txt \
+        -q)
     echo "📦 Uploading vendor bundle (offline packages + PGSnapper)..."
     aws s3 cp "$VENDOR_ZIP" "s3://$CODE_BUCKET/vendor.zip" --region "$REGION"
     echo "   Uploaded vendor.zip ($(du -sh "$VENDOR_ZIP" | cut -f1))"
+    rm -f "$VENDOR_ZIP"
 fi
 
 # Determine the data bucket name.
@@ -383,7 +355,8 @@ aws cloudformation "$OPERATION" \
         "ParameterKey=AssignPublicIP,ParameterValue=${ASSIGN_PUBLIC_IP:-true}" \
         "ParameterKey=CreateSSMEndpoints,ParameterValue=${CREATE_SSM_ENDPOINTS:-false}" \
         "ParameterKey=DBPort,ParameterValue=${DB_PORT:-5432}" \
-        "ParameterKey=InstallMode,ParameterValue=${AIRGAPPED:+airgapped}${AIRGAPPED:-online}" \
+        "ParameterKey=InstallMode,ParameterValue=$([ "${AIRGAPPED:-false}" = "true" ] && echo airgapped || echo online)" \
+        "ParameterKey=RouteTableIds,ParameterValue=${ROUTE_TABLE_IDS:-}" \
         "ParameterKey=SADataBucket,ParameterValue=$SA_DATA_BUCKET" \
         "ParameterKey=ResolvedDataBucketName,ParameterValue=$RESOLVED_DATA_BUCKET" \
         "ParameterKey=EnableScheduledCollection,ParameterValue=$ENABLE_SCHEDULED" \

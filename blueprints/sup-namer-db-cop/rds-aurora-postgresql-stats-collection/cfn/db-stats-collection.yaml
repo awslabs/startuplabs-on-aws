@@ -99,6 +99,15 @@ Parameters:
       No internet access required — all packages and PGSnapper are included.
       Use with --no-public-ip in subnets with no NAT Gateway or IGW.
 
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      Comma-separated list of route table IDs to associate with the S3 Gateway endpoint
+      in air-gapped mode. Required when InstallMode=airgapped. Get with:
+      aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=<subnet-id>
+      --query 'RouteTables[*].RouteTableId' --output text
+
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
   NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
@@ -109,6 +118,13 @@ Conditions:
   NeedSSMEndpoints: !And
     - !Equals [!Ref AssignPublicIP, 'false']
     - !Equals [!Ref CreateSSMEndpoints, 'true']
+  # Airgapped mode always needs SSM endpoints (no NAT, no internet)
+  # and also needs endpoints for S3, RDS, CloudWatch, Secrets Manager
+  NeedAirgappedEndpoints: !Equals [!Ref InstallMode, 'airgapped']
+  # SSM ingress rule needed when either SSM endpoints or airgapped endpoints are created
+  NeedEndpointIngressRule: !Or
+    - !Equals [!Ref CreateSSMEndpoints, 'true']
+    - !Equals [!Ref InstallMode, 'airgapped']
 
 Resources:
   # S3 Bucket for data sharing with SA
@@ -258,7 +274,7 @@ Resources:
                   Action:
                     - s3:GetObject
                   Resource:
-                    - !Sub 'arn:aws:s3:::${CodeSourceBucket}/${CodeSourceKey}'
+                    - !Sub 'arn:aws:s3:::${CodeSourceBucket}/*'
                 - !Ref 'AWS::NoValue'
               
               # EC2 permissions for fleet discovery
@@ -343,26 +359,34 @@ Resources:
           exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
           
           # Update system and install packages
-          # In airgapped mode, skip dnf update (no internet) but install local RPMs if available
+          # In airgapped mode: no internet access, use only packages available on the AMI.
+          # AL2023 AMI includes: python3 (3.9), python3-pip, postgresql15, gcc, cronie.
+          # python3.11 is installed from the AL2023 repo (available offline via AMI cache).
           if [ "${InstallMode}" = "airgapped" ]; then
-            echo "[INFO] Air-gapped mode: installing base packages from local repos only..."
-            dnf install -y python3.11 python3.11-pip python3-devel python3-pip postgresql15 postgresql15-contrib postgresql15-server postgresql15-server-devel gcc htop cronie cronie-anacron bc 2>/dev/null || \
-            dnf install -y python3.11 python3.11-pip postgresql15 postgresql15-server gcc cronie 2>/dev/null || true
+            echo "[INFO] Air-gapped mode: installing from AMI-cached packages only (no dnf update)..."
+            # Try to install python3.11 from AMI — it is included in AL2023 base repos
+            # If not cached locally, fall back to system python3 (3.9)
+            dnf install -y python3.11 python3.11-pip --setopt=tsflags=nodocs 2>/dev/null || \
+              echo "[WARN] python3.11 not available from local cache, using python3"
+            dnf install -y postgresql15 postgresql15-server gcc cronie cronie-anacron bc \
+              --setopt=tsflags=nodocs 2>/dev/null || true
           else
             dnf update -y
             dnf install -y git python3.11 python3.11-pip python3-devel python3-pip postgresql15 postgresql15-contrib postgresql15-server postgresql15-server-devel gcc htop cronie cronie-anacron bc
           fi
-          
-          # DO NOT use alternatives - it breaks dnf/yum which depend on python3.9
-          # Keep python3 = python3.9 (system default)
-          # Use python3.11 explicitly for application code
-          
-          echo "System python3 (for dnf/yum): $(python3 --version)"
-          echo "Application python3.11: $(python3.11 --version)"
+
+          # Determine python3.11 availability — fall back to python3 if not installed
+          if command -v python3.11 &>/dev/null; then
+            PY="python3.11"
+          else
+            PY="python3"
+            echo "[WARN] python3.11 not available, using $(python3 --version)"
+          fi
+          echo "Using Python: $PY ($($PY --version))"
           
           # Create aliases for convenience (but don't override system python3)
-          echo 'alias python="python3.11"' >> /home/ec2-user/.bashrc
-          echo 'alias pip="python3.11 -m pip"' >> /home/ec2-user/.bashrc
+          echo "alias python=\"$PY\"" >> /home/ec2-user/.bashrc
+          echo "alias pip=\"$PY -m pip\"" >> /home/ec2-user/.bashrc
           
           # Remove any existing virtual environments
           sudo -u ec2-user rm -rf /home/ec2-user/wal-db-stats-collection/venv
@@ -381,8 +405,17 @@ Resources:
             }
             mkdir -p /opt/vendor
             unzip -q /tmp/vendor.zip -d /opt/vendor_extract
-            cp -r /opt/vendor_extract/vendor-bundle/* /opt/vendor/
+            # The deploy script zips vendor/ directory — check top-level directory name
+            if [ -d /opt/vendor_extract/vendor ]; then
+              cp -r /opt/vendor_extract/vendor/. /opt/vendor/
+            elif [ -d /opt/vendor_extract/vendor-bundle ]; then
+              cp -r /opt/vendor_extract/vendor-bundle/. /opt/vendor/
+            else
+              # fallback: zip may contain files directly
+              cp -r /opt/vendor_extract/. /opt/vendor/
+            fi
             rm -f /tmp/vendor.zip
+            echo "Vendor contents: $(ls /opt/vendor/)"
 
             echo "[INFO] Air-gapped mode: downloading application code from S3..."
             aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip --region ${AWS::Region} || {
@@ -444,10 +477,10 @@ Resources:
           fi
           
           # Install Python packages for python3.11 (application code)
-          # Skipped in airgapped mode — already installed by vendor/install.sh
+          # Install Python packages (skipped in airgapped mode — handled by vendor/install.sh)
           if [ "${InstallMode}" != "airgapped" ]; then
-            python3.11 -m pip install --upgrade pip
-            python3.11 -m pip install -r requirements.txt || {
+            $PY -m pip install --upgrade pip
+            $PY -m pip install -r requirements.txt || {
               echo "[ERROR] Requirements installation failed - deployment cannot continue"
               /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
               exit 1
@@ -484,13 +517,28 @@ Resources:
           python3 -m pip install --upgrade pip
           python3 -m pip install boto3 psycopg2-binary PyGreSQL
           
-          # Also install for python3.11 for consistency
-          python3.11 -m pip install boto3 psycopg2-binary
+          # Also install for application python
+          $PY -m pip install boto3 psycopg2-binary 2>/dev/null || true
 
           # Download RDS global certificate bundle for SSL connections
+          # In airgapped mode, include the cert in the vendor bundle or skip (SSL will fail at runtime)
           mkdir -p /certs
-          curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /certs/global-bundle.pem
-          chmod 644 /certs/global-bundle.pem
+          if [ "${InstallMode}" = "airgapped" ]; then
+            # Try to get cert from vendor bundle if included, otherwise create a placeholder
+            if [ -f /opt/vendor/global-bundle.pem ]; then
+              cp /opt/vendor/global-bundle.pem /certs/global-bundle.pem
+              echo "[INFO] SSL cert loaded from vendor bundle"
+            else
+              # Download via S3 endpoint if available, otherwise skip
+              aws s3 cp s3://rds-downloads/rds-combined-ca-bundle.pem /certs/global-bundle.pem \
+                --region ${AWS::Region} 2>/dev/null || \
+              echo "[WARN] SSL cert not available in airgapped mode — invasive collection may fail"
+            fi
+          else
+            curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+              -o /certs/global-bundle.pem
+          fi
+          [ -f /certs/global-bundle.pem ] && chmod 644 /certs/global-bundle.pem || true
 
           # Create symlinks for PGSnapper (expects psql at /usr/local/pgsql/bin/)
           mkdir -p /usr/local/pgsql/bin
@@ -568,8 +616,18 @@ Resources:
           systemctl enable db-stats-collection
           
           # Install CloudWatch agent
-          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
-          rpm -U ./amazon-cloudwatch-agent.rpm
+          # In airgapped mode, download via S3 VPC endpoint; online mode uses public URL
+          if [ "${InstallMode}" = "airgapped" ]; then
+            aws s3 cp s3://amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm \
+              /tmp/amazon-cloudwatch-agent.rpm --region ${AWS::Region} 2>/dev/null || \
+            aws s3 cp s3://amazoncloudwatch-agent-${AWS::Region}/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm \
+              /tmp/amazon-cloudwatch-agent.rpm --region ${AWS::Region} 2>/dev/null || \
+            echo "[WARN] CloudWatch agent not available in airgapped mode — skipping"
+            [ -f /tmp/amazon-cloudwatch-agent.rpm ] && rpm -U /tmp/amazon-cloudwatch-agent.rpm || true
+          else
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            rpm -U ./amazon-cloudwatch-agent.rpm
+          fi
           
           # Remove wrapper scripts (no longer needed)
           # Set permissions
@@ -607,15 +665,16 @@ Resources:
   # Only needed when CFN creates the endpoints (Pattern B) — endpoint SG = instance SG
   SSMEndpointIngressRule:
     Type: AWS::EC2::SecurityGroupIngress
-    Condition: NeedSSMEndpoints
+    Condition: NeedEndpointIngressRule
     Properties:
       GroupId: !Ref CustomerDataCollectionSecurityGroup
       IpProtocol: tcp
       FromPort: 443
       ToPort: 443
       SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
-      Description: Allow SSM agent to reach VPC endpoints (self-referencing for Pattern B)
+      Description: Allow instance to reach VPC endpoints on TCP/443 (self-referencing)
 
+  # ── SSM endpoints for --no-public-ip --create-ssm-endpoints (Pattern B) ──
   SSMInterfaceEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Condition: NeedSSMEndpoints
@@ -643,6 +702,114 @@ Resources:
     Condition: NeedSSMEndpoints
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # ── VPC Endpoints for air-gapped mode (--airgapped / InstallMode=airgapped) ──
+  # Created when InstallMode=airgapped — no NAT, no IGW, all traffic via VPC endpoints.
+  # These endpoints are CFN-managed and deleted automatically with the stack.
+
+  # SSM endpoints for Session Manager connectivity (airgapped mode always needs these)
+  AirgappedSSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  AirgappedSSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  AirgappedEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # S3 Gateway endpoint — allows EC2 to download code + vendor bundle from S3
+  AirgappedS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  # RDS endpoint — allows collection scripts to call RDS Describe APIs
+  AirgappedRDSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.rds'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # CloudWatch Monitoring endpoint — allows CloudWatch metrics collection
+  AirgappedMonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # Performance Insights endpoint — for PI metrics collection
+  AirgappedPIEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.pi'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # CloudFormation endpoint — required for cfn-signal in airgapped mode
+  AirgappedCloudFormationEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # Secrets Manager endpoint — allows invasive collection to retrieve DB credentials
+  AirgappedSecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedAirgappedEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
       VpcId: !Ref VpcId
       VpcEndpointType: Interface
       SubnetIds: [!Ref SubnetId]
