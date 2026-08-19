@@ -90,9 +90,10 @@ WITH deployment_context AS (
     SELECT '{deployment_type}'::text as deployment_type
 ),
 recommended_settings AS (
-    SELECT 'shared_buffers' as name, 'Aurora-managed via instance class - verify sizing' as recommendation,
-        'Medium' as priority, 'Memory' as category, 'Aurora' as applicable_to,
-        'Auto-managed but visible - verify adequate for workload' as description
+    SELECT 'shared_buffers' as name,
+        'Set to 25% of instance RAM. On Aurora: auto-managed but visible - verify adequate for workload. On RDS/RDS Multi-AZ: tunable parameter - set explicitly in parameter group.' as recommendation,
+        'Medium' as priority, 'Memory' as category, 'All' as applicable_to,
+        'Key buffer pool parameter. Tunable on RDS and RDS Multi-AZ DB Cluster; auto-managed on Aurora but still visible.' as description
     UNION ALL SELECT 'work_mem', 'Start at 4MB, tune for complex analytical queries',
         'High', 'Memory', 'All', 'Tunable - same guidance as standard PostgreSQL'
     UNION ALL SELECT 'maintenance_work_mem', 'Increase for large table maintenance',
@@ -658,27 +659,67 @@ SELECT metric, value, description, details, recommendation
 FROM (
     SELECT 'Deployment Type' as metric, deployment as value,
         'Detected database deployment environment' as description,
-        'Aurora uses storage-level replication (6-way, 3 AZs). WAL-based replication not applicable' as details,
-        'INFO: Use Aurora Replicas for read scaling. Cross-region via Aurora Global Database' as recommendation,
+        CASE deployment
+            WHEN 'Aurora'
+                THEN 'Aurora uses storage-level replication (6-way, 3 AZs). WAL-based replication not applicable'
+            WHEN 'RDS Multi-AZ DB Cluster'
+                THEN 'RDS Multi-AZ DB Cluster uses synchronous streaming replication to 2 readable standbys across AZs. Automatic failover in ~35s.'
+            ELSE 'Standard PostgreSQL WAL-based streaming replication'
+        END as details,
+        CASE deployment
+            WHEN 'Aurora'
+                THEN 'INFO: Use Aurora Replicas for read scaling. Cross-region via Aurora Global Database'
+            WHEN 'RDS Multi-AZ DB Cluster'
+                THEN 'INFO: 2 readable standbys provide synchronous HA. Monitor ReplicaLag CloudWatch metric (not AuroraReplicaLag). Read scale-out via readable standbys.'
+            ELSE 'INFO: Configure read replicas for read scaling. Monitor ReplicaLag CloudWatch metric'
+        END as recommendation,
         0 as sort_order
     FROM db_role
     UNION ALL
     SELECT 'Database Role', server_role, 'Current database role and WAL configuration',
         'WAL Level: ' || wal_level || ', Server Role: ' || server_role,
-        CASE WHEN server_role = 'REPLICA' THEN 'OK: Aurora Reader instance' ELSE 'OK: Aurora Writer instance' END,
+        CASE deployment
+            WHEN 'Aurora'
+                THEN CASE WHEN server_role = 'REPLICA' THEN 'OK: Aurora Reader instance' ELSE 'OK: Aurora Writer instance' END
+            WHEN 'RDS Multi-AZ DB Cluster'
+                THEN CASE WHEN server_role = 'REPLICA' THEN 'OK: Readable standby instance' ELSE 'OK: Writer instance' END
+            ELSE
+                CASE WHEN server_role = 'REPLICA' THEN 'OK: Replica instance' ELSE 'OK: Primary instance' END
+        END,
         1 FROM db_role
     UNION ALL
     SELECT 'Connected Replicas', COALESCE((SELECT COUNT(*)::text FROM pg_stat_replication), '0'),
-        'Aurora Replicas connected via storage layer (may not appear in pg_stat_replication)',
+        CASE deployment
+            WHEN 'Aurora' THEN 'Aurora Replicas connected via storage layer (may not appear in pg_stat_replication)'
+            WHEN 'RDS Multi-AZ DB Cluster' THEN 'Readable standbys connected via synchronous streaming replication'
+            ELSE 'Replicas connected via WAL streaming replication'
+        END,
         CASE WHEN (SELECT COUNT(*) FROM pg_stat_replication) > 0
             THEN (SELECT COUNT(*)::text FROM pg_stat_replication) || ' replica(s) connected'
-            ELSE 'Aurora replicas use storage-level replication - check AWS Console' END,
+            ELSE
+                CASE deployment
+                    WHEN 'Aurora' THEN 'Aurora replicas use storage-level replication - check AWS Console'
+                    WHEN 'RDS Multi-AZ DB Cluster' THEN 'No streaming replicas visible in pg_stat_replication — standbys may connect via separate slot. Check RDS console and CloudWatch ReplicaLag metric.'
+                    ELSE 'No replicas connected'
+                END
+        END,
         CASE WHEN (SELECT COUNT(*) FROM pg_stat_replication) > 0 THEN 'OK: Replication active'
-            ELSE 'INFO: Check Aurora console for replica count and lag' END,
+            ELSE
+                CASE deployment
+                    WHEN 'Aurora' THEN 'INFO: Check Aurora console for replica count and lag'
+                    WHEN 'RDS Multi-AZ DB Cluster' THEN 'INFO: Check RDS console and CloudWatch ReplicaLag for standby health'
+                    ELSE 'INFO: No replicas detected'
+                END
+        END,
         2 FROM db_role
     UNION ALL
-    SELECT 'WAL Archiving', 'Managed',
-        'Aurora manages WAL archiving internally via continuous backup',
+    SELECT 'WAL Archiving',
+        CASE deployment WHEN 'Aurora' THEN 'Managed' WHEN 'RDS Multi-AZ DB Cluster' THEN 'Managed' ELSE 'Configured' END,
+        CASE deployment
+            WHEN 'Aurora' THEN 'Aurora manages WAL archiving internally via continuous backup'
+            WHEN 'RDS Multi-AZ DB Cluster' THEN 'RDS manages WAL archiving via automated backup'
+            ELSE 'WAL archiving configured via archive_command'
+        END,
         'Continuous backup enabled. Retention configurable via AWS Console',
         'INFO: Managed by AWS. Configure backup retention in AWS Console',
         3 FROM pg_stat_archiver CROSS JOIN db_role
@@ -689,13 +730,13 @@ FROM (
             WHEN wal_level IN ('logical', 'replica') THEN 'Configured (no slots)'
             ELSE 'Not configured' END,
         CASE WHEN wal_level IN ('logical', 'replica')
-            THEN 'User-configured WAL replication detected on Aurora. WAL accumulation requires monitoring'
+            THEN 'User-configured WAL replication detected. WAL accumulation requires monitoring'
             ELSE 'WAL level does not support replication' END,
         CASE WHEN (SELECT COUNT(*) FROM pg_replication_slots WHERE NOT active) > 0
             THEN 'INACTIVE SLOTS: ' || (SELECT COUNT(*)::text FROM pg_replication_slots WHERE NOT active)
             ELSE 'No replication slots' END,
         CASE WHEN (SELECT COUNT(*) FROM pg_replication_slots WHERE NOT active) > 0
-            THEN 'CRITICAL: Drop inactive slots to prevent WAL buildup. Aurora storage grows with WAL - direct cost impact'
+            THEN 'CRITICAL: Drop inactive slots to prevent WAL buildup. Storage grows with WAL accumulation - direct cost impact'
             ELSE 'INFO: No WAL-based replication configured' END,
         4 FROM db_role
 ) AS replication_metrics ORDER BY sort_order;
