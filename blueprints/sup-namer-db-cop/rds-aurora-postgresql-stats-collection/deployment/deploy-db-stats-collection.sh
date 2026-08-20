@@ -167,10 +167,87 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
     echo "🔍 Checking network prerequisites for --no-public-ip mode..."
 
     if [[ "${AIRGAPPED:-false}" == "true" ]]; then
-        # Air-gapped mode: VPC endpoints are created by CFN (NeedAirgappedEndpoints condition)
-        # No pre-flight endpoint checks needed here — CFN manages them
-        echo "   🔒 Air-gapped mode: VPC endpoints will be created by CloudFormation"
-        echo "      (s3, ssm, ssmmessages, ec2messages, rds, monitoring, pi, cloudformation, secretsmanager)"
+        # Air-gapped mode: check which of the 9 required endpoints already exist in the VPC.
+        # Only pass 'true' for endpoints that are MISSING — CFN will create only those.
+        # Endpoints that already exist are left alone (skipped by CFN), avoiding the
+        # 'private DNS conflict' error caused by trying to create a duplicate endpoint.
+        echo "   🔒 Air-gapped mode: checking which VPC endpoints need to be created..."
+
+        AIRGAPPED_SERVICES=(ssm ssmmessages ec2messages rds monitoring pi cloudformation secretsmanager)
+        # Map service name -> CFN parameter name
+        declare -A SVC_PARAM=(
+            [ssm]="CreateSSMEndpoint"
+            [ssmmessages]="CreateSSMMessagesEndpoint"
+            [ec2messages]="CreateEC2MessagesEndpoint"
+            [rds]="CreateRDSEndpoint"
+            [monitoring]="CreateMonitoringEndpoint"
+            [pi]="CreatePIEndpoint"
+            [cloudformation]="CreateCloudFormationEndpoint"
+            [secretsmanager]="CreateSecretsManagerEndpoint"
+        )
+
+        # Build per-endpoint parameter values
+        declare -A EP_CREATE
+        declare -A EP_EXISTING_ID
+        for SVC in "${AIRGAPPED_SERVICES[@]}"; do
+            EXISTING=$(aws ec2 describe-vpc-endpoints \
+                --filters "Name=service-name,Values=com.amazonaws.${REGION}.${SVC}" \
+                          "Name=vpc-id,Values=${VPC_ID}" \
+                          "Name=vpc-endpoint-state,Values=available,pending" \
+                --query 'VpcEndpoints[0].VpcEndpointId' \
+                --output text --region "$REGION" 2>/dev/null || true)
+            if [ -z "$EXISTING" ] || [ "$EXISTING" = "None" ]; then
+                EP_CREATE[$SVC]="true"
+                echo "      ➕ $SVC: will be created by CFN"
+            else
+                # Check if this endpoint is owned by THIS stack (CFN manages it)
+                # If so, pass 'true' so CFN keeps managing it on update.
+                # If owned by another stack or created manually, pass 'false' to skip.
+                OWNER_STACK=$(aws ec2 describe-tags --region "$REGION" \
+                    --filters "Name=resource-id,Values=${EXISTING}" \
+                              "Name=key,Values=aws:cloudformation:stack-name" \
+                    --query 'Tags[0].Value' --output text 2>/dev/null || true)
+                if [ "$OWNER_STACK" = "$STACK_NAME" ]; then
+                    EP_CREATE[$SVC]="true"
+                    echo "      ♻️  $SVC: owned by this stack ($EXISTING) — CFN will keep managing it"
+                else
+                    EP_CREATE[$SVC]="false"
+                    EP_EXISTING_ID[$SVC]="$EXISTING"
+                    if [ -z "$OWNER_STACK" ] || [ "$OWNER_STACK" = "None" ]; then
+                        echo "      ✅ $SVC: pre-existing ($EXISTING, not CFN-managed) — CFN will skip"
+                    else
+                        echo "      ✅ $SVC: owned by stack '$OWNER_STACK' ($EXISTING) — CFN will skip"
+                    fi
+                fi
+            fi
+        done
+
+        # S3 is a Gateway endpoint — same logic
+        S3_EXISTING=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=service-name,Values=com.amazonaws.${REGION}.s3" \
+                      "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=vpc-endpoint-type,Values=Gateway" \
+                      "Name=vpc-endpoint-state,Values=available,pending" \
+            --query 'VpcEndpoints[0].VpcEndpointId' \
+            --output text --region "$REGION" 2>/dev/null || true)
+        if [ -z "$S3_EXISTING" ] || [ "$S3_EXISTING" = "None" ]; then
+            EP_CREATE[s3]="true"
+            echo "      ➕ s3 (Gateway): will be created by CFN"
+        else
+            S3_OWNER=$(aws ec2 describe-tags --region "$REGION" \
+                --filters "Name=resource-id,Values=${S3_EXISTING}" \
+                          "Name=key,Values=aws:cloudformation:stack-name" \
+                --query 'Tags[0].Value' --output text 2>/dev/null || true)
+            if [ "$S3_OWNER" = "$STACK_NAME" ]; then
+                EP_CREATE[s3]="true"
+                echo "      ♻️  s3 (Gateway): owned by this stack ($S3_EXISTING) — CFN will keep managing it"
+            else
+                EP_CREATE[s3]="false"
+                EP_EXISTING_ID[s3]="$S3_EXISTING"
+                echo "      ✅ s3 (Gateway): pre-existing ($S3_EXISTING) — CFN will skip"
+            fi
+        fi
+
         # Auto-discover route table for S3 Gateway endpoint if not provided
         if [ -z "$ROUTE_TABLE_IDS" ]; then
             ROUTE_TABLE_IDS=$(aws ec2 describe-route-tables \
@@ -296,6 +373,7 @@ if [[ "${AIRGAPPED:-false}" == "true" ]]; then
         vendor/pgsnapper \
         vendor/install.sh \
         vendor/requirements.txt \
+        vendor/global-bundle.pem \
         -q)
     echo "📦 Uploading vendor bundle (offline packages + PGSnapper)..."
     aws s3 cp "$VENDOR_ZIP" "s3://$CODE_BUCKET/vendor.zip" --region "$REGION"
@@ -363,6 +441,17 @@ aws cloudformation "$OPERATION" \
         "ParameterKey=CollectionSchedule,ParameterValue=$SCHEDULE" \
         "ParameterKey=CodeSourceBucket,ParameterValue=$CODE_BUCKET" \
         "ParameterKey=CodeSourceKey,ParameterValue=$CODE_KEY" \
+        $(if [[ "${AIRGAPPED:-false}" == "true" ]]; then
+            echo "ParameterKey=CreateSSMEndpoint,ParameterValue=${EP_CREATE[ssm]:-false}"
+            echo "ParameterKey=CreateSSMMessagesEndpoint,ParameterValue=${EP_CREATE[ssmmessages]:-false}"
+            echo "ParameterKey=CreateEC2MessagesEndpoint,ParameterValue=${EP_CREATE[ec2messages]:-false}"
+            echo "ParameterKey=CreateS3Endpoint,ParameterValue=${EP_CREATE[s3]:-false}"
+            echo "ParameterKey=CreateRDSEndpoint,ParameterValue=${EP_CREATE[rds]:-false}"
+            echo "ParameterKey=CreateMonitoringEndpoint,ParameterValue=${EP_CREATE[monitoring]:-false}"
+            echo "ParameterKey=CreatePIEndpoint,ParameterValue=${EP_CREATE[pi]:-false}"
+            echo "ParameterKey=CreateCloudFormationEndpoint,ParameterValue=${EP_CREATE[cloudformation]:-false}"
+            echo "ParameterKey=CreateSecretsManagerEndpoint,ParameterValue=${EP_CREATE[secretsmanager]:-false}"
+        fi) \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "$REGION"
 
@@ -371,11 +460,69 @@ aws cloudformation wait "stack-${OPERATION%-stack}-complete" \
     --stack-name "$STACK_NAME" \
     --region "$REGION"
 
+# ── Post-deploy: add instance SG inbound rule to pre-existing airgapped endpoints ──
+# For any airgapped endpoints that already existed (skipped by CFN), add an inbound
+# TCP/443 rule on the endpoint's SG from the instance SG so the instance can reach them.
+# CFN-created endpoints already have the instance SG attached at creation time.
+if [[ "${AIRGAPPED:-false}" == "true" ]]; then
+    INSTANCE_SG=$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceSecurityGroup`].OutputValue' \
+        --output text 2>/dev/null)
+
+    if [ -n "$INSTANCE_SG" ] && [ "$INSTANCE_SG" != "None" ]; then
+        # Track which endpoint SGs we've already patched to avoid duplicate-rule errors
+        # when multiple pre-existing endpoints share the same SG.
+        declare -A PATCHED_SGS
+        for SVC in "${!EP_EXISTING_ID[@]}"; do
+            EP_ID="${EP_EXISTING_ID[$SVC]}"
+            [ -z "$EP_ID" ] && continue
+
+            # S3 Gateway endpoints have no SG — skip
+            EP_TYPE=$(aws ec2 describe-vpc-endpoints \
+                --vpc-endpoint-ids "$EP_ID" --region "$REGION" \
+                --query 'VpcEndpoints[0].VpcEndpointType' --output text 2>/dev/null || true)
+            [ "$EP_TYPE" = "Gateway" ] && continue
+
+            # Get the endpoint's attached SG
+            ENDPOINT_SG=$(aws ec2 describe-vpc-endpoints \
+                --vpc-endpoint-ids "$EP_ID" --region "$REGION" \
+                --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null || true)
+            [ -z "$ENDPOINT_SG" ] || [ "$ENDPOINT_SG" = "None" ] && continue
+
+            # If we already patched this SG for a previous endpoint, reuse result
+            if [ "${PATCHED_SGS[$ENDPOINT_SG]+_}" ]; then
+                echo "   ✅ $SVC ($EP_ID): shares endpoint SG $ENDPOINT_SG — rule already handled"
+                continue
+            fi
+
+            # Check if rule already exists (query by group-id only, then filter in jq/python)
+            RULE_EXISTS=$(aws ec2 describe-security-group-rules \
+                --filters "Name=group-id,Values=${ENDPOINT_SG}" \
+                --region "$REGION" \
+                --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='${INSTANCE_SG}' && FromPort==\`443\` && !IsEgress].SecurityGroupRuleId" \
+                --output text 2>/dev/null || true)
+            if [ -n "$RULE_EXISTS" ] && [ "$RULE_EXISTS" != "None" ]; then
+                echo "   ✅ $SVC ($EP_ID): inbound rule already exists on endpoint SG $ENDPOINT_SG"
+                PATCHED_SGS[$ENDPOINT_SG]="existing"
+            else
+                aws ec2 authorize-security-group-ingress \
+                    --group-id "$ENDPOINT_SG" \
+                    --protocol tcp --port 443 \
+                    --source-group "$INSTANCE_SG" \
+                    --region "$REGION" --output text > /dev/null 2>&1 \
+                    && echo "   ✅ $SVC ($EP_ID): added inbound TCP/443 from $INSTANCE_SG to endpoint SG $ENDPOINT_SG" \
+                    && PATCHED_SGS[$ENDPOINT_SG]="added" \
+                    || echo "   ⚠️  $SVC ($EP_ID): could not add inbound rule (check permissions)"
+            fi
+        done
+    fi
+fi
+
 # ── Post-deploy: configure pre-existing SSM endpoints for --no-public-ip ────
-# If the VPC already has SSM endpoints (CreateSSMEndpoints=false / default),
-# the deploy script ensures they include this stack's subnet and instance SG.
-# This makes SSM Session Manager work without creating duplicate endpoints.
-if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-false}" == "false" ]]; then
+# Only applies to Mode 2 (--no-public-ip without --airgapped).
+# In airgapped mode, SSM endpoints are either CFN-managed or already patched above.
+if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-false}" == "false" ]] && [[ "${AIRGAPPED:-false}" == "false" ]]; then
     echo ""
     echo "🔗 Configuring pre-existing SSM endpoints for this deployment..."
 
@@ -425,9 +572,8 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
                 # Check if rule already exists
                 RULE_EXISTS=$(aws ec2 describe-security-group-rules \
                     --filters "Name=group-id,Values=${ENDPOINT_SG}" \
-                              "Name=referenced-group-id,Values=${INSTANCE_SG}" \
                     --region "$REGION" \
-                    --query 'SecurityGroupRules[?FromPort==`443`].SecurityGroupRuleId' \
+                    --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='${INSTANCE_SG}' && FromPort==\`443\` && !IsEgress].SecurityGroupRuleId" \
                     --output text 2>/dev/null || true)
                 if [ -n "$RULE_EXISTS" ] && [ "$RULE_EXISTS" != "None" ]; then
                     echo "   ✅ $SVC endpoint SG: inbound rule already exists"

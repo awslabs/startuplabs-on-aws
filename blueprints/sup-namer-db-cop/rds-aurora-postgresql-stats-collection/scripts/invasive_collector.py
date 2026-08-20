@@ -1662,15 +1662,31 @@ def main():
             secret_data = json.loads(secret_response['SecretString'])
             args.db_password = secret_data.get('password')
             if not args.db_password:
-                print("⚠️  Warning: Could not extract password from secret, will prompt")
+                print("❌ Error: Secret found but does not contain a 'password' key.")
+                print(f"   Secret ARN: {args.db_secret_arn}")
+                print("   Ensure the secret has a 'password' field in its JSON value.")
+                return 1
         except Exception as e:
-            print(f"⚠️  Warning: Could not retrieve password from Secrets Manager: {e}")
-            print("   Will prompt for password instead")
-    
-    # Prompt for password only if still not available
+            print(f"❌ Error: Could not retrieve password from Secrets Manager: {e}")
+            print(f"   Secret ARN: {args.db_secret_arn}")
+            print("   Verify the ARN is correct and the EC2 role has secretsmanager:GetSecretValue.")
+            print("   Note: If the ARN contains '!' (e.g. rds!cluster-...), wrap it in single quotes")
+            print("   when calling enable-invasive-collection.sh to prevent bash history expansion.")
+            return 1
+
+    # Prompt for password only if no secret ARN was provided (interactive use only)
     if not args.db_password:
-        import getpass
-        args.db_password = getpass.getpass("Database password: ")
+        if not args.db_secret_arn:
+            import getpass
+            try:
+                args.db_password = getpass.getpass("Database password: ")
+            except (EOFError, OSError):
+                print("❌ Error: No password available and cannot prompt (non-interactive terminal).")
+                print("   Provide --db-secret-arn to retrieve the password from Secrets Manager.")
+                return 1
+        else:
+            print("❌ Error: Password could not be retrieved from Secrets Manager and no fallback is available.")
+            return 1
     
     try:
         collector = InvasiveCollector(
@@ -1720,10 +1736,16 @@ def main():
                 print(f"✅ Invasive data collection completed successfully for cluster {args.cluster_id}")
                 print(f"   Including PGSnapper analysis with {result['pgsnapper']['data_status']['days']} days of data")
             elif pgsnapper_status == 'error':
-                print(f"\n⚠️  PGSnapper data collection encountered an error")
-                print(f"   Error: {result['pgsnapper'].get('error')}")
-                print(f"   {result['pgsnapper'].get('next_steps')}")
+                print(f"\n⚠️  PGSnapper setup could not complete:")
+                print(f"   {result['pgsnapper'].get('error')}")
+                missing = result['pgsnapper'].get('missing', [])
+                if missing:
+                    print(f"\n   Action required before re-running:")
+                    for item in missing:
+                        print(f"     {item}")
                 print(f"\n✅ Non-invasive and basic invasive data collection completed (without PGSnapper)")
+                print(f"   Fix the issue above, then re-run ./collect-and-share.sh to set up PGSnapper.")
+                return 1
         else:
             print(f"✅ Invasive data collection completed successfully for cluster {args.cluster_id}")
         

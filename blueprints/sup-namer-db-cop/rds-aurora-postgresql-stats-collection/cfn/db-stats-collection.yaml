@@ -108,6 +108,64 @@ Parameters:
       aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=<subnet-id>
       --query 'RouteTables[*].RouteTableId' --output text
 
+  # Per-endpoint creation flags for airgapped mode.
+  # Deploy script sets each to 'true' only if the endpoint does NOT already exist in the VPC.
+  # This prevents 'private DNS conflict' errors when re-deploying into a VPC that already
+  # has some endpoints from a previous run.
+  CreateSSMEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create SSM interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateSSMMessagesEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create SSMMessages interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateEC2MessagesEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create EC2Messages interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateS3Endpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create S3 gateway endpoint (airgapped mode). Set false if already exists.
+
+  CreateRDSEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create RDS interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateMonitoringEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudWatch Monitoring interface endpoint (airgapped mode). Set false if already exists.
+
+  CreatePIEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create Performance Insights interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateCloudFormationEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudFormation interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateSecretsManagerEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create Secrets Manager interface endpoint (airgapped mode). Set false if already exists.
+
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
   NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
@@ -118,13 +176,29 @@ Conditions:
   NeedSSMEndpoints: !And
     - !Equals [!Ref AssignPublicIP, 'false']
     - !Equals [!Ref CreateSSMEndpoints, 'true']
-  # Airgapped mode always needs SSM endpoints (no NAT, no internet)
-  # and also needs endpoints for S3, RDS, CloudWatch, Secrets Manager
-  NeedAirgappedEndpoints: !Equals [!Ref InstallMode, 'airgapped']
-  # SSM ingress rule needed when either SSM endpoints or airgapped endpoints are created
+  # Per-endpoint conditions for airgapped mode.
+  # Each is set to true only when the deploy script confirms the endpoint does not
+  # already exist in the VPC — avoiding 'private DNS conflict' errors on re-deploy.
+  NeedSSMEndpoint:             !Equals [!Ref CreateSSMEndpoint, 'true']
+  NeedSSMMessagesEndpoint:     !Equals [!Ref CreateSSMMessagesEndpoint, 'true']
+  NeedEC2MessagesEndpoint:     !Equals [!Ref CreateEC2MessagesEndpoint, 'true']
+  NeedS3Endpoint:              !Equals [!Ref CreateS3Endpoint, 'true']
+  NeedRDSEndpoint:             !Equals [!Ref CreateRDSEndpoint, 'true']
+  NeedMonitoringEndpoint:      !Equals [!Ref CreateMonitoringEndpoint, 'true']
+  NeedPIEndpoint:              !Equals [!Ref CreatePIEndpoint, 'true']
+  NeedCloudFormationEndpoint:  !Equals [!Ref CreateCloudFormationEndpoint, 'true']
+  NeedSecretsManagerEndpoint:  !Equals [!Ref CreateSecretsManagerEndpoint, 'true']
+  # SSM ingress rule needed when any endpoint will be created by this stack
   NeedEndpointIngressRule: !Or
     - !Equals [!Ref CreateSSMEndpoints, 'true']
-    - !Equals [!Ref InstallMode, 'airgapped']
+    - !Equals [!Ref CreateSSMEndpoint, 'true']
+    - !Equals [!Ref CreateSSMMessagesEndpoint, 'true']
+    - !Equals [!Ref CreateEC2MessagesEndpoint, 'true']
+    - !Equals [!Ref CreateRDSEndpoint, 'true']
+    - !Equals [!Ref CreateMonitoringEndpoint, 'true']
+    - !Equals [!Ref CreatePIEndpoint, 'true']
+    - !Equals [!Ref CreateCloudFormationEndpoint, 'true']
+    - !Equals [!Ref CreateSecretsManagerEndpoint, 'true']
 
 Resources:
   # S3 Bucket for data sharing with SA
@@ -704,13 +778,14 @@ Resources:
       PrivateDnsEnabled: true
 
   # ── VPC Endpoints for air-gapped mode (--airgapped / InstallMode=airgapped) ──
-  # Created when InstallMode=airgapped — no NAT, no IGW, all traffic via VPC endpoints.
-  # These endpoints are CFN-managed and deleted automatically with the stack.
+  # Each endpoint has its own condition. The deploy script checks whether the endpoint
+  # already exists in the VPC and only passes 'true' for missing ones — avoiding
+  # 'private DNS conflict' errors when re-deploying into a VPC with existing endpoints.
 
   # SSM endpoints for Session Manager connectivity (airgapped mode always needs these)
   AirgappedSSMEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedSSMEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
       VpcId: !Ref VpcId
@@ -721,7 +796,7 @@ Resources:
 
   AirgappedSSMMessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedSSMMessagesEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
       VpcId: !Ref VpcId
@@ -732,7 +807,7 @@ Resources:
 
   AirgappedEC2MessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedEC2MessagesEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
       VpcId: !Ref VpcId
@@ -744,7 +819,7 @@ Resources:
   # S3 Gateway endpoint — allows EC2 to download code + vendor bundle from S3
   AirgappedS3Endpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedS3Endpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
       VpcId: !Ref VpcId
@@ -754,7 +829,7 @@ Resources:
   # RDS endpoint — allows collection scripts to call RDS Describe APIs
   AirgappedRDSEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedRDSEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.rds'
       VpcId: !Ref VpcId
@@ -766,7 +841,7 @@ Resources:
   # CloudWatch Monitoring endpoint — allows CloudWatch metrics collection
   AirgappedMonitoringEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedMonitoringEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
       VpcId: !Ref VpcId
@@ -778,7 +853,7 @@ Resources:
   # Performance Insights endpoint — for PI metrics collection
   AirgappedPIEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedPIEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.pi'
       VpcId: !Ref VpcId
@@ -790,7 +865,7 @@ Resources:
   # CloudFormation endpoint — required for cfn-signal in airgapped mode
   AirgappedCloudFormationEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedCloudFormationEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
       VpcId: !Ref VpcId
@@ -802,7 +877,7 @@ Resources:
   # Secrets Manager endpoint — allows invasive collection to retrieve DB credentials
   AirgappedSecretsManagerEndpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: NeedAirgappedEndpoints
+    Condition: NeedSecretsManagerEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
       VpcId: !Ref VpcId

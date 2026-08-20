@@ -99,15 +99,24 @@ if [ "$HAS_INVASIVE" = true ] && [ "$NEEDS_SETUP" = true ]; then
         --status-file "$FLAGS_DIR/${CLUSTER_ID}_pgsnapper_status.json" \
         --setup-only \
         $SKIP_FLAG $NO_REDACT $SKIP_SECURITY
+      SETUP_EXIT=$?
+      if [ $SETUP_EXIT -ne 0 ]; then
+        SETUP_FAILED=true
+      fi
     else
       echo "⚠️  Skipping $FLAG_FILE — missing DB_HOST, DB_USER, or DB_SECRET_ARN"
     fi
   done
   echo ""
-  # Show actual wait time from the last flag file's PGSNAPPER_MIN_DAYS
-  WAIT_DAYS="${PGSNAPPER_MIN_DAYS:-1}"
-  echo "✅ Setup complete. Wait for $WAIT_DAYS day(s) worth of snapshots,"
-  echo "   then run ./collect-and-share.sh again to collect all data."
+  if [ "${SETUP_FAILED:-false}" = "true" ]; then
+    echo "⚠️  PGSnapper setup did not complete for one or more clusters (see errors above)."
+    echo "   Fix the reported issues, then re-run ./collect-and-share.sh to retry setup."
+  else
+    # Show actual wait time from the last flag file's PGSNAPPER_MIN_DAYS
+    WAIT_DAYS="${PGSNAPPER_MIN_DAYS:-1}"
+    echo "✅ Setup complete. Wait for $WAIT_DAYS day(s) worth of snapshots,"
+    echo "   then run ./collect-and-share.sh again to collect all data."
+  fi
 
 elif [ "$HAS_INVASIVE" = true ]; then
   # ── Run 2: Collect everything (aligned timestamps) ──
