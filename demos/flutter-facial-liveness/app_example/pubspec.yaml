@@ -1,0 +1,28 @@
+name: rekognition_app_example
+description: Example Flutter app that captures an image and analyzes it with Amazon Rekognition via the rekognition_client wrapper.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^2.5.0
+  image_picker: ^1.1.0
+  flutter_image_compress: ^2.3.0
+  rekognition_client:
+    path: ../packages/rekognition_client
+  rekognition_liveness:
+    path: ../packages/rekognition_liveness
+  http: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

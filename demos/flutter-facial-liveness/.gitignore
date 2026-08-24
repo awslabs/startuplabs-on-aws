@@ -1,0 +1,31 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+
+# CDK / Node
+node_modules/
+cdk.out/
+cdk-outputs.json
+*.tsbuildinfo
+
+# Env / secrets — never commit resolved config values
+.env
+.env.local
+dart_defines.json
+key.properties
+*.keystore
+*.jks
+
+# iOS
+*.xcuserstate
+xcuserdata/
+
+# OS
+.DS_Store
+
+# npm lockfile — samples resolve fresh; avoids flagging unfixable bundled CDK transitive deps
+package-lock.json
