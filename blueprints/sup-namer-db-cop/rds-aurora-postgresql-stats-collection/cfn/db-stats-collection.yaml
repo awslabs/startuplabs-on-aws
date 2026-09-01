@@ -262,6 +262,13 @@ Resources:
               Access log destination bucket. Access is fully restricted via
               PublicAccessBlockConfiguration (all four options enabled).
               A DenyNonSSL bucket policy is applied via CustomerDataAccessLogBucketPolicy.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >
+              This bucket IS the S3 access log destination for CustomerDataBucket.
+              AWS prohibits a logging target bucket from logging to itself (circular
+              dependency). Matches W35 cfn_nag suppression rationale.
     Properties:
       BucketName: !Sub "${AWS::StackName}-access-logs-${AWS::AccountId}"
       BucketEncryption:
@@ -481,6 +488,14 @@ Resources:
               configurable DB port only. Destination IPs are dynamic AWS service endpoints
               and customer RDS hosts whose CIDRs are unknown at deploy time. No all-port
               or all-protocol egress is permitted.
+      checkov:
+        skip:
+          - id: CKV_AWS_23
+            comment: >
+              The SSH ingress rule is inside a CFN !If conditional and includes a Description
+              field. Checkov cannot evaluate CloudFormation conditionals and incorrectly
+              flags this as missing a description. All egress rules have explicit Description
+              fields. No rule is missing a description.
     Properties:
       GroupName: !Sub '${AWS::StackName}-DataCollectionSG'
       GroupDescription: Security group for Customer Data Collection EC2 instance
@@ -834,6 +849,14 @@ Resources:
               and configure a CloudWatch Logs key access policy, which adds deployment
               friction disproportionate to the risk for a 30-day bootstrap log.
               CloudWatch Logs applies SSE at rest regardless.
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: >
+              Bootstrap-only log group (EC2 UserData output: package installs, git clone,
+              cfn-signal). No customer data or PII. KMS CMK would require customers to
+              pre-create a key and configure CloudWatch Logs access — disproportionate
+              burden for a 30-day bootstrap log. Matches W84 cfn_nag rationale.
     Properties:
       LogGroupName: !Sub '/aws/ec2/db-stats-collection/${AWS::StackName}'
       RetentionInDays: 30
