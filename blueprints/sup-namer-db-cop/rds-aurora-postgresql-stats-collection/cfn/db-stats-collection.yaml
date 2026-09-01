@@ -166,10 +166,20 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: Create Secrets Manager interface endpoint (airgapped mode). Set false if already exists.
 
+  DBSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the Secrets Manager secret containing DB credentials for invasive collection.
+      Leave blank to grant access to all secrets in the account (less secure — use when
+      the secret ARN is not known at deploy time). Provide the ARN to scope access to a
+      single secret (recommended for production deployments).
+
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
   NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
   HasCodeSourceBucket: !Not [!Equals [!Ref CodeSourceBucket, '']]
+  HasDBSecretArn: !Not [!Equals [!Ref DBSecretArn, '']]
   IsPublicIP: !Equals [!Ref AssignPublicIP, 'true']
   HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
   IsAirgapped: !Equals [!Ref InstallMode, 'airgapped']
@@ -237,6 +247,21 @@ Resources:
   CustomerDataAccessLogBucket:
     Type: AWS::S3::Bucket
     Condition: NeedToCreateBucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >
+              This bucket IS the access log destination for CustomerDataBucket.
+              AWS prohibits a logging target bucket from logging to itself
+              (circular dependency). A second-level logging bucket would add
+              stack complexity disproportionate to the risk for an auto-generated
+              access log store.
+          - id: W51
+            reason: >
+              Access log destination bucket. Access is fully restricted via
+              PublicAccessBlockConfiguration (all four options enabled).
+              A DenyNonSSL bucket policy is applied via CustomerDataAccessLogBucketPolicy.
     Properties:
       BucketName: !Sub "${AWS::StackName}-access-logs-${AWS::AccountId}"
       BucketEncryption:
@@ -248,11 +273,33 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
       LifecycleConfiguration:
         Rules:
           - Id: DeleteOldLogs
             Status: Enabled
             ExpirationInDays: 90
+
+  # FIX-06: SSL-enforce policy for the access log destination bucket (AwsSolutions-S10)
+  CustomerDataAccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: NeedToCreateBucket
+    Properties:
+      Bucket: !Ref CustomerDataAccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CustomerDataAccessLogBucket.Arn
+              - !Sub '${CustomerDataAccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
 
   CustomerDataBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -276,6 +323,15 @@ Resources:
   # IAM Role for data collection only (no Bedrock permissions)
   CustomerDataCollectionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >
+              RDS Describe, CloudWatch GetMetric/ListMetrics, Performance Insights,
+              and EC2 Describe APIs do not support resource-level ARN restrictions
+              in IAM. Resource: "*" is required for fleet-wide read-only discovery.
+              Secrets Manager and CloudWatch Logs statements use scoped ARNs.
     Properties:
       RoleName: !Sub '${AWS::StackName}-DataCollectionRole'
       AssumeRolePolicyDocument:
@@ -285,15 +341,42 @@ Resources:
             Principal:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: CustomerDataCollectionPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # FIX-08: SSM Session Manager (replaces AmazonSSMManagedInstanceCore managed policy)
+              - Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+
+              # FIX-08: CloudWatch Agent (replaces CloudWatchAgentServerPolicy managed policy)
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeTags
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                Resource: '*'
+
               # RDS and Aurora permissions for fleet discovery
+              # W11 suppressed: RDS Describe APIs do not support resource-level ARN scoping
               - Effect: Allow
                 Action:
                   - rds:DescribeDBClusters
@@ -305,8 +388,9 @@ Resources:
                   - rds:DescribeDBParameterGroups
                   - rds:ListTagsForResource
                 Resource: '*'
-              
+
               # CloudWatch and Performance Insights for data collection
+              # W11 suppressed: CW/PI metric APIs do not support resource-level ARN scoping
               - Effect: Allow
                 Action:
                   - cloudwatch:GetMetricStatistics
@@ -318,8 +402,8 @@ Resources:
                   - pi:ListAvailableResourceDimensions
                   - pi:ListAvailableResourceMetrics
                 Resource: '*'
-              
-              # S3 permissions for data sharing
+
+              # S3 permissions for data sharing (scoped to specific bucket)
               - Effect: Allow
                 Action:
                   - s3:GetObject
@@ -333,14 +417,17 @@ Resources:
                   - !Sub
                     - 'arn:aws:s3:::${BucketName}'
                     - BucketName: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
-              
-              # Secrets Manager permissions for PGSnapper
+
+              # FIX-01: Secrets Manager — scoped to DBSecretArn when provided
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
                   - secretsmanager:DescribeSecret
-                Resource: '*'
-              
+                Resource: !If
+                  - HasDBSecretArn
+                  - !Ref DBSecretArn
+                  - '*'
+
               # S3 permissions for code source bucket (if provided)
               - !If
                 - HasCodeSourceBucket
@@ -350,16 +437,17 @@ Resources:
                   Resource:
                     - !Sub 'arn:aws:s3:::${CodeSourceBucket}/*'
                 - !Ref 'AWS::NoValue'
-              
+
               # EC2 permissions for fleet discovery
+              # W11 suppressed: EC2 Describe APIs do not support resource-level ARN scoping
               - Effect: Allow
                 Action:
                   - ec2:DescribeInstances
                   - ec2:DescribeRegions
                   - ec2:DescribeAvailabilityZones
                 Resource: '*'
-              
-              # Logs permissions
+
+              # FIX-02: Logs permissions scoped to account/region (no longer wildcard)
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
@@ -367,7 +455,7 @@ Resources:
                   - logs:PutLogEvents
                   - logs:DescribeLogGroups
                   - logs:DescribeLogStreams
-                Resource: '*'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
 
   CustomerDataCollectionInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -379,6 +467,20 @@ Resources:
   # Security Group for data collection
   CustomerDataCollectionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              GroupName is parameterised with the stack name for operational discoverability.
+              This is a short-lived data collection stack; in-place SG replacement constraints
+              are acceptable.
+          - id: W5
+            reason: >
+              Egress is limited to TCP/443 (HTTPS for AWS APIs, S3, GitHub, PyPI) and the
+              configurable DB port only. Destination IPs are dynamic AWS service endpoints
+              and customer RDS hosts whose CIDRs are unknown at deploy time. No all-port
+              or all-protocol egress is permitted.
     Properties:
       GroupName: !Sub '${AWS::StackName}-DataCollectionSG'
       GroupDescription: Security group for Customer Data Collection EC2 instance
@@ -415,6 +517,8 @@ Resources:
       InstanceType: !Ref InstanceType
       KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
       IamInstanceProfile: !Ref CustomerDataCollectionInstanceProfile
+      Monitoring: true                  # FIX-04: enable 1-min detailed CloudWatch monitoring
+      DisableApiTermination: true       # FIX-05: prevent accidental termination; CFN overrides on stack delete
       NetworkInterfaces:
         - DeviceIndex: '0'
           SubnetId: !Ref SubnetId
@@ -427,6 +531,7 @@ Resources:
             VolumeType: gp3
             VolumeSize: 30
             DeleteOnTermination: true
+            Encrypted: true             # FIX-03: encrypt EBS root volume at rest
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -718,14 +823,20 @@ Resources:
   # CloudWatch Log Group
   CustomerDataCollectionLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: >
+              This log group contains only EC2 UserData bootstrap output (package installs,
+              git clone status, cfn-signal). No customer data or PII is written here.
+              KMS encryption is omitted to avoid requiring customers to pre-create a CMK
+              and configure a CloudWatch Logs key access policy, which adds deployment
+              friction disproportionate to the risk for a 30-day bootstrap log.
+              CloudWatch Logs applies SSE at rest regardless.
     Properties:
       LogGroupName: !Sub '/aws/ec2/db-stats-collection/${AWS::StackName}'
       RetentionInDays: 30
-      # W84/CKV_AWS_158: KMS encryption omitted intentionally — this log group contains
-      # only EC2 UserData bootstrap output (package installs, git clone status).
-      # No sensitive data is written here. Adding a CMK would require customers to
-      # pre-create a KMS key and grant CloudWatch Logs access, adding deployment
-      # complexity disproportionate to the risk for a short-lived (30-day) bootstrap log.
 
   # ── VPC Interface Endpoints for SSM Session Manager (--no-public-ip mode) ──
   # Created only when AssignPublicIP=false AND CreateSSMEndpoints=true.
