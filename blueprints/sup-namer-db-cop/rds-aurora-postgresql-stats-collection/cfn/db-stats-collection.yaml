@@ -174,6 +174,29 @@ Parameters:
       Leave blank to grant access to all secrets in the account (less secure — use when
       the secret ARN is not known at deploy time). Provide the ARN to scope access to a
       single secret (recommended for production deployments).
+  ExistingSSMEndpointSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >
+      (Air-gapped mode only) Security Group ID attached to pre-existing SSM, SSMMessages,
+      or EC2Messages VPC Interface Endpoints in this VPC.
+
+      WHY THIS EXISTS: When those endpoints already exist (not created by this stack), they
+      have their own SG that the instance SG is not part of. The EC2 bootstrap script calls
+      cfn-signal via SSM — if the instance cannot reach the SSM endpoint on TCP/443, the
+      signal never arrives, CloudFormation times out, and the stack rolls back.
+
+      This parameter causes CFN to add an inbound TCP/443 rule from the instance SG to the
+      specified endpoint SG as part of stack creation, before the EC2 wait condition fires.
+
+      WHO SETS IT: The deploy script auto-detects this value from the pre-existing endpoints
+      and passes it automatically — you do not need to set it manually.
+
+      CLEANUP NOTE: The ingress rule added by this stack will be removed automatically when
+      the stack is deleted. If multiple stacks add rules to the same endpoint SG, deleting
+      one stack only removes its own rule.
+
+      Leave blank when CFN creates all endpoints (they use the instance SG directly).
 
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
@@ -182,6 +205,7 @@ Conditions:
   HasDBSecretArn: !Not [!Equals [!Ref DBSecretArn, '']]
   IsPublicIP: !Equals [!Ref AssignPublicIP, 'true']
   HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  HasExistingEndpointSG: !Not [!Equals [!Ref ExistingSSMEndpointSecurityGroupId, '']]
   IsAirgapped: !Equals [!Ref InstallMode, 'airgapped']
   NeedSSMEndpoints: !And
     - !Equals [!Ref AssignPublicIP, 'false']
@@ -876,6 +900,21 @@ Resources:
       ToPort: 443
       SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
       Description: Allow instance to reach VPC endpoints on TCP/443 (self-referencing)
+
+  # ── Inbound rule on pre-existing endpoint SG (air-gapped, pre-existing endpoints) ──
+  # When SSM/SSMMessages/EC2Messages endpoints already exist in the VPC and use a
+  # different SG (e.g. default SG), the instance SG must be allowed inbound on TCP/443
+  # on that endpoint SG. Without this, cfn-signal and SSM agent timeout during bootstrap.
+  PreExistingEndpointIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExistingEndpointSG
+    Properties:
+      GroupId: !Ref ExistingSSMEndpointSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
+      Description: !Sub 'Allow ${AWS::StackName} instance to reach pre-existing VPC endpoints on TCP/443'
 
   # ── SSM endpoints for --no-public-ip --create-ssm-endpoints (Pattern B) ──
   SSMInterfaceEndpoint:

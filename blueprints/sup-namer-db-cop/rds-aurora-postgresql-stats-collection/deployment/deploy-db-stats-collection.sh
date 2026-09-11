@@ -254,8 +254,33 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
                 --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
                 --region "$REGION" \
                 --query 'RouteTables[*].RouteTableId' --output text 2>/dev/null | tr '\t' ',')
-            echo "   Auto-detected route table(s): $ROUTE_TABLE_IDS"
+            # If no explicit association, fall back to the VPC main route table
+            if [ -z "$ROUTE_TABLE_IDS" ] || [ "$ROUTE_TABLE_IDS" = "None" ]; then
+                ROUTE_TABLE_IDS=$(aws ec2 describe-route-tables \
+                    --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=true" \
+                    --region "$REGION" \
+                    --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null)
+                echo "   Auto-detected main route table (subnet has no explicit association): $ROUTE_TABLE_IDS"
+            else
+                echo "   Auto-detected route table(s): $ROUTE_TABLE_IDS"
+            fi
         fi
+        # Detect the SG on any pre-existing SSM/SSMMessages/EC2Messages endpoints so CFN
+        # can add an inbound rule for the instance SG — required for bootstrap to succeed.
+        EXISTING_ENDPOINT_SG=""
+        for SVC in ssm ssmmessages ec2messages; do
+            if [ "${EP_CREATE[$SVC]:-true}" = "false" ] && [ -n "${EP_EXISTING_ID[$SVC]:-}" ]; then
+                DETECTED_SG=$(aws ec2 describe-vpc-endpoints \
+                    --vpc-endpoint-ids "${EP_EXISTING_ID[$SVC]}" \
+                    --region "$REGION" \
+                    --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null || true)
+                if [ -n "$DETECTED_SG" ] && [ "$DETECTED_SG" != "None" ]; then
+                    EXISTING_ENDPOINT_SG="$DETECTED_SG"
+                    echo "   🔐 Pre-existing $SVC endpoint SG: $EXISTING_ENDPOINT_SG (will add instance ingress rule)"
+                    break
+                fi
+            fi
+        done
     else
         HAS_NAT=$(aws ec2 describe-route-tables \
             --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
@@ -451,6 +476,7 @@ aws cloudformation "$OPERATION" \
             echo "ParameterKey=CreatePIEndpoint,ParameterValue=${EP_CREATE[pi]:-false}"
             echo "ParameterKey=CreateCloudFormationEndpoint,ParameterValue=${EP_CREATE[cloudformation]:-false}"
             echo "ParameterKey=CreateSecretsManagerEndpoint,ParameterValue=${EP_CREATE[secretsmanager]:-false}"
+            echo "ParameterKey=ExistingSSMEndpointSecurityGroupId,ParameterValue=${EXISTING_ENDPOINT_SG:-}"
         fi) \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "$REGION"
