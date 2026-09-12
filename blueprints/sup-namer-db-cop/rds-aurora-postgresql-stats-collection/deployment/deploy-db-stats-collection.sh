@@ -162,6 +162,104 @@ if [[ "$ALLOWED_CIDR" == "0.0.0.0/0" ]]; then
 fi
 SA_DATA_BUCKET=${SA_DATA_BUCKET:-""}
 
+# ── Pre-flight: check pre-existing Interface Endpoints with PrivateDnsEnabled=true
+#    are reachable from the chosen subnet.
+#
+#    A VPC Interface Endpoint with PrivateDnsEnabled=true overrides public DNS for the
+#    service hostname (e.g. rds.us-east-1.amazonaws.com) VPC-wide. The endpoint ENI
+#    only exists in its configured subnets. If the chosen subnet is NOT in the endpoint's
+#    subnet list, DNS resolves to the endpoint ENI's private IP which is unreachable
+#    from the instance — AWS API calls silently time out. This affects ALL modes (1, 2, 3).
+#    Being in the same AZ is NOT sufficient — the chosen subnet must be explicitly listed
+#    in the endpoint's subnet configuration.
+#
+#    Fix: redeploy using one of the subnets the endpoint is deployed in.
+# ─────────────────────────────────────────────────────────────────────────────────────────
+echo "🔍 Checking for pre-existing VPC Interface Endpoints that may affect API routing..."
+SERVICES_TO_CHECK=(ssm ssmmessages ec2messages rds monitoring pi cloudformation secretsmanager)
+ENDPOINT_ERRORS=()
+if [ -n "$SUBNET_ID" ]; then
+    for SVC in "${SERVICES_TO_CHECK[@]}"; do
+        EP_INFO=$(aws ec2 describe-vpc-endpoints \
+            --region "$REGION" \
+            --filters "Name=service-name,Values=com.amazonaws.${REGION}.${SVC}" \
+                      "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=vpc-endpoint-state,Values=available,pending" \
+            --query 'VpcEndpoints[0].{Id:VpcEndpointId,Dns:PrivateDnsEnabled,Subnets:SubnetIds}' \
+            --output json 2>/dev/null || echo "null")
+        EP_ID=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Id','') or '')" 2>/dev/null || true)
+        EP_DNS=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Dns','') or '')" 2>/dev/null || true)
+        EP_SUBNETS=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(d.get('Subnets') or []))" 2>/dev/null || true)
+        [ -z "$EP_ID" ] && continue
+        [ "$EP_DNS" != "True" ] && continue
+        # Chosen subnet is in the endpoint — ENI is directly reachable.
+        # Also check the endpoint's SG allows port 443 from the instance SG (or all sources).
+        # If not, the TCP connection will be silently dropped even though DNS resolves correctly.
+        if echo "$EP_SUBNETS" | grep -qw "$SUBNET_ID"; then
+            echo "   ✅ $SVC ($EP_ID): chosen subnet is in endpoint subnet list — reachable"
+            # Get the endpoint's SG
+            EP_SG=$(aws ec2 describe-vpc-endpoints \
+                --vpc-endpoint-ids "$EP_ID" --region "$REGION" \
+                --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null || true)
+            if [ -n "$EP_SG" ] && [ "$EP_SG" != "None" ]; then
+                # Check if port 443 is open to 0.0.0.0/0, the instance SG, or the subnet CIDR
+                HAS_443=$(aws ec2 describe-security-group-rules \
+                    --filters "Name=group-id,Values=$EP_SG" \
+                    --region "$REGION" \
+                    --query "SecurityGroupRules[?!IsEgress && FromPort<=\`443\` && ToPort>=\`443\`].{Cidr:CidrIpv4,SG:ReferencedGroupInfo.GroupId}" \
+                    --output json 2>/dev/null || echo "[]")
+                ALLOWS_ALL=$(echo "$HAS_443" | python3 -c "import sys,json; rules=json.load(sys.stdin); print('yes' if any(r.get('Cidr')=='0.0.0.0/0' for r in rules) else 'no')" 2>/dev/null)
+                # INSTANCE_SG is not yet known at pre-flight time (CFN creates it), so we record
+                # the endpoint SG for post-deploy rule injection instead.
+                if [ "$ALLOWS_ALL" != "yes" ]; then
+                    echo "      ⚠️  Endpoint SG $EP_SG does not open TCP/443 to all sources."
+                    echo "         This is a pre-existing shared security group in your account."
+                    echo "         After stack creation, the deploy script will automatically add"
+                    echo "         an inbound TCP/443 rule from the new instance SG to $EP_SG"
+                    echo "         so the collection instance can reach AWS APIs via this endpoint."
+                    echo "         The rule will be scoped to only this stack's instance SG (least privilege)."
+                    # Record for post-deploy injection (keyed by endpoint SG, deduplicated)
+                    PRE_EXISTING_EP_SGS="${PRE_EXISTING_EP_SGS:-} $EP_SG"
+                fi
+            fi
+            continue
+        fi
+        # Chosen subnet is NOT in the endpoint's subnet list.
+        # The endpoint ENI's private IP is only reachable from its own subnets.
+        EP_SUBNET_LIST="$(echo $EP_SUBNETS | xargs)"
+        ENDPOINT_ERRORS+=("$SVC|$EP_ID|$EP_SUBNET_LIST")
+        echo "   ❌ $SVC ($EP_ID): PrivateDnsEnabled=true but chosen subnet $SUBNET_ID is not in endpoint"
+        echo "      Endpoint subnets: $EP_SUBNET_LIST"
+    done
+fi
+if [ ${#ENDPOINT_ERRORS[@]} -gt 0 ]; then
+    echo ""
+    echo "❌ Deployment blocked: pre-existing VPC Interface Endpoint(s) with PrivateDnsEnabled=true"
+    echo "   do not include the chosen subnet ($SUBNET_ID)."
+    echo ""
+    echo "   Because Private DNS is enabled, all instances in this VPC resolve AWS service"
+    echo "   hostnames to the endpoint's private IP. That IP is only reachable from the"
+    echo "   subnet(s) the endpoint is deployed in — not from $SUBNET_ID."
+    echo "   AWS API calls (rds:Describe*, cloudwatch:GetMetrics, etc.) would silently time out."
+    echo ""
+    echo "   Affected endpoints:"
+    for ERR in "${ENDPOINT_ERRORS[@]}"; do
+        SVC="${ERR%%|*}"; REST="${ERR#*|}"; EP_ID="${REST%%|*}"; EP_SUBNETS_ERR="${REST##*|}"
+        echo "     $SVC ($EP_ID) — endpoint subnet(s): $EP_SUBNETS_ERR"
+    done
+    echo "   This would cause AWS API calls (rds:Describe*, cloudwatch:GetMetrics, etc.) to silently"
+    echo "   fail — DNS resolves the service hostname to a private IP unreachable from subnet $SUBNET_ID."
+    echo ""
+    echo "   Affected endpoints:"
+    for ERR in "${ENDPOINT_ERRORS[@]}"; do
+        SVC="${ERR%%|*}"; REST="${ERR#*|}"; EP_ID="${REST%%|*}"; EP_SUBNETS_ERR="${REST##*|}"
+        echo "     $SVC ($EP_ID) — endpoint subnet(s): $EP_SUBNETS_ERR"
+    done
+    echo ""
+    echo "   Fix: use --subnet-id with one of the subnet IDs listed above for the affected endpoint(s)."
+    exit 1
+fi
+
 # ── Pre-flight check: --no-public-ip requires NAT Gateway or VPC endpoints ──
 if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
     echo "🔍 Checking network prerequisites for --no-public-ip mode..."
@@ -391,10 +489,30 @@ if [[ "${AIRGAPPED:-false}" == "true" ]]; then
         echo "   Expected at: $VENDOR_DIR"
         exit 1
     fi
+    # Download python3.11 RPMs for offline install on the air-gapped EC2 instance.
+    # python3.11 is NOT pre-installed on the AL2023 AMI — it must be bundled here.
+    # RPMs are downloaded from the AL2023 repo on this machine (which has internet)
+    # and included in the vendor bundle for offline dnf localinstall on the instance.
+    RPM_DIR="$VENDOR_DIR/rpms"
+    mkdir -p "$RPM_DIR"
+    if ! ls "$RPM_DIR"/python3.11-*.rpm &>/dev/null 2>&1; then
+        echo "📦 Downloading python3.11 RPMs for air-gapped install..."
+        if command -v dnf &>/dev/null; then
+            dnf download --destdir="$RPM_DIR" --resolve python3.11 python3.11-pip 2>/dev/null \
+                && echo "   Downloaded $(ls "$RPM_DIR"/*.rpm 2>/dev/null | wc -l) RPMs" \
+                || echo "   ⚠️  dnf download failed — python3.11 RPMs not available on this machine"
+        else
+            echo "   ⚠️  dnf not available on this machine — python3.11 RPMs not bundled"
+            echo "      Air-gapped instance will fall back to system python3 + pip"
+        fi
+    else
+        echo "📦 Using cached python3.11 RPMs ($(ls "$RPM_DIR"/*.rpm | wc -l) files)"
+    fi
     VENDOR_ZIP="/tmp/vendor-$STACK_NAME.zip"
     echo "📦 Building vendor bundle from vendor/ directory..."
     (cd "$REPO_ROOT" && zip -r "$VENDOR_ZIP" \
         vendor/wheels \
+        vendor/rpms \
         vendor/pgsnapper \
         vendor/install.sh \
         vendor/requirements.txt \
@@ -435,9 +553,11 @@ echo "Scheduled Collection: $ENABLE_SCHEDULED"
 echo "Schedule: $SCHEDULE"
 echo ""
 
-# Check if stack exists
-if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
-    echo "📝 Stack exists, updating..."
+# Check if stack exists and is in a live (non-deleted) state
+STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+if [[ "$STACK_STATUS" != "DOES_NOT_EXIST" && "$STACK_STATUS" != "DELETE_COMPLETE" && "$STACK_STATUS" != "None" ]]; then
+    echo "📝 Stack exists ($STACK_STATUS), updating..."
     OPERATION="update-stack"
 else
     echo "🆕 Creating new stack..."
@@ -482,9 +602,39 @@ aws cloudformation "$OPERATION" \
     --region "$REGION"
 
 echo "⏳ Waiting for stack operation to complete..."
-aws cloudformation wait "stack-${OPERATION%-stack}-complete" \
-    --stack-name "$STACK_NAME" \
-    --region "$REGION"
+# Use python3 polling instead of aws cloudformation wait to avoid the AWS CLI waiter bug
+# where it resolves the stack name to a stale DELETE_COMPLETE ARN and immediately fails.
+python3 - <<PYEOF
+import boto3, time, sys
+cf = boto3.client('cloudformation', region_name='${REGION}')
+terminal_create = {'CREATE_COMPLETE','CREATE_FAILED','ROLLBACK_COMPLETE','ROLLBACK_FAILED'}
+terminal_update = {'UPDATE_COMPLETE','UPDATE_FAILED','UPDATE_ROLLBACK_COMPLETE','UPDATE_ROLLBACK_FAILED'}
+terminal = terminal_create | terminal_update
+i = 0
+while True:
+    try:
+        r = cf.describe_stacks(StackName='${STACK_NAME}')
+        status = r['Stacks'][0]['StackStatus']
+        print(f'[{i*15}s] {status}', flush=True)
+        if status in terminal:
+            if 'COMPLETE' in status and 'ROLLBACK' not in status and 'FAILED' not in status:
+                sys.exit(0)
+            else:
+                sys.exit(1)
+    except cf.exceptions.ClientError as e:
+        if 'does not exist' in str(e):
+            print(f'[{i*15}s] waiting for stack to appear...', flush=True)
+        else:
+            print(f'Error: {e}', flush=True)
+            sys.exit(1)
+    time.sleep(15)
+    i += 1
+PYEOF
+WAIT_EXIT=$?
+if [ $WAIT_EXIT -ne 0 ]; then
+    echo "❌ Stack operation failed."
+    exit 1
+fi
 
 # ── Post-deploy: add instance SG inbound rule to pre-existing airgapped endpoints ──
 # For any airgapped endpoints that already existed (skipped by CFN), add an inbound
@@ -618,6 +768,43 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
     else
         echo "   ⚠️  Could not retrieve instance security group — SSM endpoint configuration skipped."
         echo "      You may need to manually add this stack's SG to existing SSM VPC endpoint SGs."
+    fi
+fi
+
+# ── Post-deploy: inject instance SG into pre-existing endpoint SGs detected at pre-flight ──
+# When a pre-existing VPC Interface Endpoint (rds, monitoring, pi, etc.) has PrivateDnsEnabled=true
+# and the chosen subnet is in its subnet list, the endpoint routes traffic for that service VPC-wide.
+# The endpoint's SG must allow TCP/443 from the instance SG, or API calls will be silently dropped
+# even though the subnet check passes. We add the rule here (post-deploy) because the instance SG
+# is only known after CFN creates it.
+if [ -n "${PRE_EXISTING_EP_SGS:-}" ]; then
+    INSTANCE_SG=$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceSecurityGroup`].OutputValue' \
+        --output text 2>/dev/null)
+    if [ -n "$INSTANCE_SG" ] && [ "$INSTANCE_SG" != "None" ]; then
+        echo ""
+        echo "🔗 Adding instance SG to pre-existing endpoint SG(s) for data collection access..."
+        declare -A PATCHED_PRE_SGS
+        for EP_SG in $PRE_EXISTING_EP_SGS; do
+            [ -z "$EP_SG" ] && continue
+            [ "${PATCHED_PRE_SGS[$EP_SG]+_}" ] && continue
+            PATCHED_PRE_SGS[$EP_SG]=1
+            RULE_EXISTS=$(aws ec2 describe-security-group-rules \
+                --filters "Name=group-id,Values=${EP_SG}" --region "$REGION" \
+                --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='${INSTANCE_SG}' && FromPort==\`443\` && !IsEgress].SecurityGroupRuleId" \
+                --output text 2>/dev/null || true)
+            if [ -n "$RULE_EXISTS" ] && [ "$RULE_EXISTS" != "None" ]; then
+                echo "   ✅ Endpoint SG $EP_SG: inbound TCP/443 rule for $INSTANCE_SG already exists"
+            else
+                aws ec2 authorize-security-group-ingress \
+                    --group-id "$EP_SG" --protocol tcp --port 443 \
+                    --source-group "$INSTANCE_SG" --region "$REGION" \
+                    --output text > /dev/null 2>&1 \
+                    && echo "   ✅ Endpoint SG $EP_SG: added inbound TCP/443 from $INSTANCE_SG" \
+                    || echo "   ⚠️  Endpoint SG $EP_SG: could not add rule (check permissions)"
+            fi
+        done
     fi
 fi
 

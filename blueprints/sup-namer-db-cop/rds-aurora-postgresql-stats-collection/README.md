@@ -430,7 +430,7 @@ aws cloudformation wait stack-delete-complete \
   --region <region>
 ```
 
-> **Note**: VPC endpoints created by `--airgapped` are managed by the CFN stack and deleted automatically with the stack. However, any inbound rules added to **pre-existing** endpoint SGs (endpoints that already existed in your VPC before deploying) are external references that CFN cannot clean up — Step 0 above handles those.
+> **Note**: VPC endpoints created by `--airgapped` are managed by the CFN stack and deleted automatically with the stack. However, any inbound rules added to **pre-existing** endpoint SGs are external references that CFN cannot clean up — Step 0 above handles those.
 
 > **Note**: The temporary code bucket (`wal-db-stats-code-<account-id>`) is automatically deleted by the deploy script after stack creation completes. If it was not cleaned up automatically, delete it manually: `aws s3 rb s3://wal-db-stats-code-<account-id> --force --region <region>`
 

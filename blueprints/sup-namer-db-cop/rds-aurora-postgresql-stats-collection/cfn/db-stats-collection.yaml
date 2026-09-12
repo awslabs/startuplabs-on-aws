@@ -178,25 +178,10 @@ Parameters:
     Type: String
     Default: ''
     Description: >
-      (Air-gapped mode only) Security Group ID attached to pre-existing SSM, SSMMessages,
-      or EC2Messages VPC Interface Endpoints in this VPC.
-
-      WHY THIS EXISTS: When those endpoints already exist (not created by this stack), they
-      have their own SG that the instance SG is not part of. The EC2 bootstrap script calls
-      cfn-signal via SSM — if the instance cannot reach the SSM endpoint on TCP/443, the
-      signal never arrives, CloudFormation times out, and the stack rolls back.
-
-      This parameter causes CFN to add an inbound TCP/443 rule from the instance SG to the
-      specified endpoint SG as part of stack creation, before the EC2 wait condition fires.
-
-      WHO SETS IT: The deploy script auto-detects this value from the pre-existing endpoints
-      and passes it automatically — you do not need to set it manually.
-
-      CLEANUP NOTE: The ingress rule added by this stack will be removed automatically when
-      the stack is deleted. If multiple stacks add rules to the same endpoint SG, deleting
-      one stack only removes its own rule.
-
-      Leave blank when CFN creates all endpoints (they use the instance SG directly).
+      (Air-gapped) SG ID of pre-existing SSM/SSMMessages/EC2Messages endpoints.
+      CFN adds TCP/443 from instance SG to this SG before the EC2 wait condition
+      fires, ensuring bootstrap can reach SSM. Auto-detected by deploy script.
+      Leave blank when CFN creates all endpoints.
 
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
@@ -551,6 +536,13 @@ Resources:
   # EC2 Instance for data collection only
   CustomerDataCollectionInstance:
     Type: AWS::EC2::Instance
+    # Metadata reference to AirgappedS3Endpoint creates an implicit CFN dependency when
+    # NeedS3Endpoint=true — CFN will not start the instance until the S3 Gateway endpoint
+    # is created and its route is active in the route table. This eliminates the race
+    # condition where bootstrap tries to download vendor.zip before the S3 route exists.
+    # When NeedS3Endpoint=false the endpoint pre-exists — route already active, no ordering needed.
+    Metadata:
+      S3EndpointDependency: !If [NeedS3Endpoint, !Ref AirgappedS3Endpoint, 'pre-existing']
     Properties:
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
@@ -577,17 +569,14 @@ Resources:
           exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
           
           # Update system and install packages
-          # In airgapped mode: no internet access, use only packages available on the AMI.
-          # AL2023 AMI includes: python3 (3.9), python3-pip, postgresql15, gcc, cronie.
-          # python3.11 is installed from the AL2023 repo (available offline via AMI cache).
+          # python3.11 is required by collect-and-share.sh and vendor wheels (psycopg2-binary cp311).
+          # In air-gapped mode there is no internet — python3.11 RPMs are bundled in vendor/rpms/.
+          # These are installed after vendor extraction (further below in the airgapped code path).
+          # Other packages (postgresql15, cronie, gcc) are attempted with a short timeout.
           if [ "${InstallMode}" = "airgapped" ]; then
-            echo "[INFO] Air-gapped mode: installing from AMI-cached packages only (no dnf update)..."
-            # Try to install python3.11 from AMI — it is included in AL2023 base repos
-            # If not cached locally, fall back to system python3 (3.9)
-            dnf install -y python3.11 python3.11-pip --setopt=tsflags=nodocs 2>/dev/null || \
-              echo "[WARN] python3.11 not available from local cache, using python3"
+            echo "[INFO] Air-gapped mode: installing base packages (python3.11 installed after vendor extraction)..."
             dnf install -y postgresql15 postgresql15-server gcc cronie cronie-anacron bc \
-              --setopt=tsflags=nodocs 2>/dev/null || true
+              --setopt=timeout=5 --setopt=minrate=1 --setopt=tsflags=nodocs 2>/dev/null || true
           else
             dnf update -y
             dnf install -y git python3.11 python3.11-pip python3-devel python3-pip postgresql15 postgresql15-contrib postgresql15-server postgresql15-server-devel gcc htop cronie cronie-anacron bc
@@ -616,11 +605,16 @@ Resources:
           # ── Code setup: online vs airgapped ──────────────────────────────────
           if [ "${InstallMode}" = "airgapped" ]; then
             echo "[INFO] Air-gapped mode: downloading vendor bundle from S3..."
-            aws s3 cp "s3://${CodeSourceBucket}/vendor.zip" /tmp/vendor.zip --region ${AWS::Region} || {
+            # The Metadata !If [NeedS3Endpoint, !Ref AirgappedS3Endpoint, 'pre-existing'] on
+            # this instance ensures CFN creates the S3 Gateway endpoint (and its route table
+            # entry) BEFORE launching this instance, so S3 is always reachable on first attempt.
+            if ! aws s3 cp "s3://${CodeSourceBucket}/vendor.zip" /tmp/vendor.zip \
+                --region ${AWS::Region} 2>/dev/null; then
               echo "[ERROR] Failed to download vendor.zip from S3 — ensure --airgapped was used with deploy script"
               /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
               exit 1
-            }
+            fi
+            echo "[INFO] Vendor bundle downloaded successfully"
             mkdir -p /opt/vendor
             unzip -q /tmp/vendor.zip -d /opt/vendor_extract
             # The deploy script zips vendor/ directory — check top-level directory name
@@ -635,8 +629,34 @@ Resources:
             rm -f /tmp/vendor.zip
             echo "Vendor contents: $(ls /opt/vendor/)"
 
+            # Install python3.11 from bundled RPMs — must happen after vendor extraction
+            if ls /opt/vendor/rpms/python3.11*.rpm &>/dev/null 2>&1; then
+              echo "[INFO] Installing python3.11 from vendor RPMs..."
+              dnf install -y /opt/vendor/rpms/python3.11*.rpm \
+                --setopt=tsflags=nodocs 2>/dev/null \
+                && echo "[INFO] python3.11 $(python3.11 --version 2>&1) installed" \
+                || {
+                  echo "[ERROR] python3.11 RPM install failed — cannot continue"
+                  /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                  exit 1
+                }
+            else
+              echo "[ERROR] /opt/vendor/rpms/python3.11*.rpm not found in vendor bundle"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            fi
+
+            # Install postgresql15 from vendor RPMs — provides libpq required by PyGreSQL
+            if ls /opt/vendor/rpms/postgresql15*.rpm &>/dev/null 2>&1; then
+              dnf install -y /opt/vendor/rpms/postgresql15*.rpm \
+                --setopt=tsflags=nodocs 2>/dev/null \
+                && echo "[INFO] postgresql15 installed from vendor RPMs (libpq available)" \
+                || echo "[WARN] postgresql15 RPM install failed"
+            fi
+
             echo "[INFO] Air-gapped mode: downloading application code from S3..."
-            aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip --region ${AWS::Region} || {
+            aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip \
+                --region ${AWS::Region} || {
               echo "[ERROR] Failed to download application code from S3"
               /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
               exit 1
@@ -731,12 +751,13 @@ Resources:
           cd /home/ec2-user/pgperfstats
           sudo -u ec2-user git clone https://github.com/aws-samples/aurora-and-database-migration-labs.git . || echo "Repository already exists"
           
-          # Install PGSnapper dependencies for python3.9 (PGSnapper uses #!/usr/bin/python3)
-          python3 -m pip install --upgrade pip
-          python3 -m pip install boto3 psycopg2-binary PyGreSQL
-          
-          # Also install for application python
-          $PY -m pip install boto3 psycopg2-binary 2>/dev/null || true
+          # Install PGSnapper dependencies for python3.9 — skipped in air-gapped mode
+          # (install.sh already installed boto3 and PyGreSQL from vendor bundle)
+          if [ "${InstallMode}" != "airgapped" ]; then
+            python3 -m pip install --upgrade pip
+            python3 -m pip install boto3 psycopg2-binary PyGreSQL
+            $PY -m pip install boto3 psycopg2-binary 2>/dev/null || true
+          fi
 
           # Download RDS global certificate bundle for SSL connections
           mkdir -p /certs
@@ -857,7 +878,7 @@ Resources:
           Value: Production
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT25M
+        Timeout: PT40M
 
   # CloudWatch Log Group
   CustomerDataCollectionLogGroup:
