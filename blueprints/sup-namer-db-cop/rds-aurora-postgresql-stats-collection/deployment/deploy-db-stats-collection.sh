@@ -785,11 +785,11 @@ if [ -n "${PRE_EXISTING_EP_SGS:-}" ]; then
     if [ -n "$INSTANCE_SG" ] && [ "$INSTANCE_SG" != "None" ]; then
         echo ""
         echo "🔗 Adding instance SG to pre-existing endpoint SG(s) for data collection access..."
-        declare -A PATCHED_PRE_SGS
+        PATCHED_PRE_SGS=""
         for EP_SG in $PRE_EXISTING_EP_SGS; do
             [ -z "$EP_SG" ] && continue
-            [ "${PATCHED_PRE_SGS[$EP_SG]+_}" ] && continue
-            PATCHED_PRE_SGS[$EP_SG]=1
+            echo "$PATCHED_PRE_SGS" | grep -qw "$EP_SG" && continue
+            PATCHED_PRE_SGS="$PATCHED_PRE_SGS $EP_SG"
             RULE_EXISTS=$(aws ec2 describe-security-group-rules \
                 --filters "Name=group-id,Values=${EP_SG}" --region "$REGION" \
                 --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='${INSTANCE_SG}' && FromPort==\`443\` && !IsEgress].SecurityGroupRuleId" \
