@@ -16,8 +16,8 @@ AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
 AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
 AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
 AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
-AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid                                                                                                                                                                            
-AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid                                                                                                                                                                      
+AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
 AND blocking_locks.pid != blocked_locks.pid
 JOIN pg_stat_activity_history blocking_activity ON blocking_activity.pid = blocking_locks.pid AND blocking_activity.snap_id = blocking_locks.snap_id
 WHERE NOT blocked_locks.GRANTED

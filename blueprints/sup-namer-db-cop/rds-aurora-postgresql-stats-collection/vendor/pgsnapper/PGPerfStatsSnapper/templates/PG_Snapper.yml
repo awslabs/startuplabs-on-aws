@@ -6,7 +6,7 @@ Parameters:
   VPCID:
     Description: 'VPC ID of PostgreSQL database instance (e.g., vpc-0343606e) to be monitored'
     Type: 'AWS::EC2::VPC::Id'
-   
+
   SubnetID:
     Description: 'VPC Subnet ID of the PostgreSQL database instance (e.g., subnet-a0246dcd) to be monitored'
     Type: 'AWS::EC2::Subnet::Id'
@@ -14,7 +14,7 @@ Parameters:
   DBSecurityGroupID:
     Description: 'Security Group ID of the PostgreSQL database instance (e.g., sg-8c14mg64) to be monitored'
     Type: AWS::EC2::SecurityGroup::Id
-    
+
   InstanceType:
     Description: PGSnapper EC2 instance type
     Type: String
@@ -26,7 +26,7 @@ Parameters:
     - t3.xlarge
     - t3.large
     ConstraintDescription: Must be a valid EC2 instance type.
-  
+
   EBSVolSize:
     Description: PGSnapper EC2 instance EBS Volume Size in GiB
     Type: Number
@@ -34,20 +34,20 @@ Parameters:
     ConstraintDescription: 'Must be in the range 1-16,384'
     MinValue: 1
     MaxValue: 16384
- 
+
   DBUsername:
     Description: Database User Name for the PostgreSQL Instance to be monitored
     Type: String
     MinLength: '1'
     MaxLength: '16'
-    
+
   DBUserPassword:
     Description: Database User Password for the PostgreSQL Instance to be monitored
     Type: String
     MaxLength: '32'
     MinLength: '8'
     NoEcho: 'true'
-  
+
   DBPort:
     Description: Port for the PostgreSQL Instance to be monitored
     Type: Number
@@ -76,7 +76,7 @@ Metadata:
           - DBUsername
           - DBUserPassword
           - DBPort
-             
+
 Rules:
 
   SubnetsInVPC:
@@ -88,7 +88,7 @@ Rules:
                 - VpcId
             - 'Fn::RefAll': 'AWS::EC2::VPC::Id'
         AssertDescription: The subnet doesn't belong to the specified VPC
-        
+
 Resources:
 
   LambdaExecutionRole:
@@ -253,7 +253,7 @@ Resources:
       ServiceToken: !GetAtt AMIInfoFunction.Arn
       Region: !Ref AWS::Region
       Architecture: HVM64
-      
+
   PGSnapperSecret:
     Type: AWS::SecretsManager::Secret
     Metadata:
@@ -352,7 +352,7 @@ Resources:
                   - 's3:GetObject'
                   - 's3:DeleteObject'
                 Resource: !Join [ '/' , [ !GetAtt S3Bucket.Arn, '*']]
-                Effect: Allow  
+                Effect: Allow
           PolicyName: s3-access-policy
       Path: /
       AssumeRolePolicyDocument:
@@ -370,7 +370,7 @@ Resources:
     Type: "AWS::IAM::InstanceProfile"
     Properties:
       Path: /
-      Roles: 
+      Roles:
         - !Ref EC2Role
 
   Ec2SecurityGroup:
@@ -391,7 +391,7 @@ Resources:
           ToPort: -1
           CidrIp: 0.0.0.0/0
           Description: Default outbound access for security group
-  
+
   DBSecurityGroupIngress:
     Properties:
       GroupId: !Ref DBSecurityGroupID
@@ -401,7 +401,7 @@ Resources:
       SourceSecurityGroupId: !Ref Ec2SecurityGroup
       Description: 'PGSnapper EC2 host access'
     Type: 'AWS::EC2::SecurityGroupIngress'
-      
+
   SnapperInstance:
     Type: AWS::EC2::Instance
     Metadata:
@@ -441,10 +441,10 @@ Resources:
             - - !Sub |
                 #!/bin/bash
                 cd /tmp
-      
+
                 # start bootstrap
                 echo "$(date "+%F %T") * running as $(whoami)" >> /debug.log
-      
+
                 # Start SSM & upgrade packages
                 echo "$(date "+%F %T") * Starting SSM agent" >> /debug.log
                 sudo systemctl enable amazon-ssm-agent
@@ -454,9 +454,9 @@ Resources:
                 echo "$(date "+%F %T") * Updating packages to the latest version" >> /debug.log
                 sudo yum update -y >> /debug.log
                 echo "$(date "+%F %T") * Finished updating packages to the latest version" >> /debug.log
-                
+
                 # Install PG client
-                echo "$(date "+%F %T") * Installing PG client" >> /debug.log           
+                echo "$(date "+%F %T") * Installing PG client" >> /debug.log
                 sudo yum -y group install "Development Tools" >> /debug.log
                 sudo yum -y install readline-devel >> /debug.log
                 sudo yum -y install openssl-devel >> /debug.log
@@ -471,19 +471,19 @@ Resources:
                 sudo make -C src/interfaces install >> /debug.log
                 sudo make -C doc install >> /debug.log
                 sudo /sbin/ldconfig /usr/local/pgsql/lib >> /debug.log
-                echo "$(date "+%F %T") * Finished installing PG client" >> /debug.log           
-                
+                echo "$(date "+%F %T") * Finished installing PG client" >> /debug.log
+
                 # Install required Python packages
-                echo "$(date "+%F %T") * Installing Python packages" >> /debug.log           
+                echo "$(date "+%F %T") * Installing Python packages" >> /debug.log
                 sudo yum -y install python3 python3-pip python3-devel >> /debug.log
                 PATH=/usr/local/pgsql/bin:$PATH
                 export PATH
-                pip3 install boto3 >> /debug.log 
+                pip3 install boto3 >> /debug.log
                 pip3 install PyGreSQL >> /debug.log
-                echo "$(date "+%F %T") * Finished installing Python packages" >> /debug.log           
-                
+                echo "$(date "+%F %T") * Finished installing Python packages" >> /debug.log
+
                 # Install required Python packages
-                echo "$(date "+%F %T") * Downloading PGSnapper scripts" >> /debug.log           
+                echo "$(date "+%F %T") * Downloading PGSnapper scripts" >> /debug.log
                 mkdir -p /home/ec2-user/scripts
                 cd /home/ec2-user/scripts
                 curl -L https://raw.githubusercontent.com/aws-samples/aurora-and-database-migration-labs/master/Code/PGPerfStatsSnapper/pg_perf_stat_snapper.py -o pg_perf_stat_snapper.py
@@ -493,30 +493,29 @@ Resources:
                 chmod 755 pg_perf_stat_snapper.py
                 chmod 755 pg_perf_stat_loader.py
                 echo "$(date "+%F %T") * Finished downloading PGSnapper scripts" >> /debug.log
-                
+
                 echo "$(date "+%F %T") * Updating /home/ec2-user/.bash_profile with required env variables" >> /debug.log
                 echo "export PATH=\$PATH:/usr/local/pgsql/bin/" >> /home/ec2-user/.bash_profile
                 echo "export LD_LIBRARY_PATH=/usr/local/pgsql/lib" >> /home/ec2-user/.bash_profile
                 echo "$(date "+%F %T") * Finished updating /home/ec2-user/.bash_profile" >> /debug.log
-                
+
                 echo "$(date "+%F %T") * Sending cfn signal" >> /debug.log
                 /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource SnapperInstance --region ${AWS::Region}
-                
+
 Outputs:
 
   PGSnapperEC2InstAMIID:
     Description: PGSnapper EC2 instance AMI ID
     Value: !GetAtt AMIInfo.Id
-   
+
   PGSnapperEC2InstID:
     Description: EC2 Instance ID for PGSnapper
     Value: !Ref SnapperInstance
-    
+
   PGSnapperSecretARN:
     Description: Database User Secret ARN for the PostgreSQL Instance to be monitored
     Value: !Ref PGSnapperSecret
-    
+
   PGSnapperS3Bucket:
     Description: S3 bucket to store PGSnapper output for sharing
-    Value: !Join ['', ['s3://', !Ref S3Bucket, '/']] 
-  
+    Value: !Join ['', ['s3://', !Ref S3Bucket, '/']]

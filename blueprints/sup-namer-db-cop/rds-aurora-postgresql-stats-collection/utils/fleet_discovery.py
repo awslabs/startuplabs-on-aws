@@ -59,7 +59,7 @@ class FleetDiscovery:
         """Discover Aurora PostgreSQL clusters."""
         try:
             self.logger.info("Discovering Aurora PostgreSQL clusters...")
-            
+
             paginator = self.rds_client.get_paginator('describe_db_clusters')
             aurora_clusters = []
 
@@ -77,10 +77,10 @@ class FleetDiscovery:
                     'tags': tags,
                     'arn': cluster['DBClusterArn']
                 })
-            
+
             self.logger.info(f"Found {len(aurora_clusters)} Aurora PostgreSQL clusters")
             return aurora_clusters
-            
+
         except ClientError as e:
             self.logger.error(f"Error discovering Aurora clusters: {e}")
             return []
@@ -89,7 +89,7 @@ class FleetDiscovery:
         """Discover RDS PostgreSQL instances."""
         try:
             self.logger.info("Discovering RDS PostgreSQL instances...")
-            
+
             paginator = self.rds_client.get_paginator('describe_db_instances')
             rds_instances = []
 
@@ -124,10 +124,10 @@ class FleetDiscovery:
                     'tags': tags,
                     'arn': instance['DBInstanceArn']
                 })
-            
+
             self.logger.info(f"Found {len(rds_instances)} RDS PostgreSQL instances")
             return rds_instances
-            
+
         except ClientError as e:
             self.logger.error(f"Error discovering RDS instances: {e}")
             return []
@@ -144,52 +144,52 @@ class FleetDiscovery:
             # by discover_rds_instances() to avoid duplicate/disconnected entries.
             fleet.extend(self.discover_rds_multiaz_clusters())
             fleet.extend(self.discover_rds_instances())
-        
+
         # Filter by status (only include available databases)
         active_fleet = [db for db in fleet if db['status'] in ['available', 'backing-up', 'modifying']]
-        
+
         self.logger.info(f"Total active PostgreSQL databases found: {len(active_fleet)}")
         return active_fleet
 
     def filter_fleet(self, fleet: List[Dict[str, Any]], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Filter fleet based on criteria."""
         filtered_fleet = fleet.copy()
-        
+
         # Filter by specific database identifiers (include list)
         if 'include_identifiers' in filters:
             include_list = filters['include_identifiers']
-            filtered_fleet = [db for db in filtered_fleet 
+            filtered_fleet = [db for db in filtered_fleet
                             if db['identifier'] in include_list]
-        
+
         # Filter by tags
         if 'required_tags' in filters:
             required_tags = filters['required_tags']
-            filtered_fleet = [db for db in filtered_fleet 
+            filtered_fleet = [db for db in filtered_fleet
                             if self._matches_tags(db.get('tags', {}), required_tags)]
-        
+
         # Filter by engine version
         if 'min_engine_version' in filters:
             min_version = filters['min_engine_version']
-            filtered_fleet = [db for db in filtered_fleet 
+            filtered_fleet = [db for db in filtered_fleet
                             if self._compare_versions(db['engine_version'], min_version) >= 0]
-        
+
         # Filter by database type
         if 'database_types' in filters:
             allowed_types = filters['database_types']
             filtered_fleet = [db for db in filtered_fleet if db['type'] in allowed_types]
-        
+
         # Filter by identifier pattern
         if 'identifier_pattern' in filters:
             pattern = filters['identifier_pattern'].lower()
-            filtered_fleet = [db for db in filtered_fleet 
+            filtered_fleet = [db for db in filtered_fleet
                             if pattern in db['identifier'].lower()]
-        
+
         # Exclude specific databases
         if 'exclude_identifiers' in filters:
             exclude_list = filters['exclude_identifiers']
-            filtered_fleet = [db for db in filtered_fleet 
+            filtered_fleet = [db for db in filtered_fleet
                             if db['identifier'] not in exclude_list]
-        
+
         self.logger.info(f"Fleet filtered from {len(fleet)} to {len(filtered_fleet)} databases")
         return filtered_fleet
 
@@ -197,11 +197,11 @@ class FleetDiscovery:
         """Compare two version strings. Returns -1, 0, or 1."""
         def version_tuple(v):
             return tuple(map(int, (v.split("."))))
-        
+
         try:
             v1_tuple = version_tuple(version1)
             v2_tuple = version_tuple(version2)
-            
+
             if v1_tuple < v2_tuple:
                 return -1
             elif v1_tuple > v2_tuple:
@@ -225,7 +225,7 @@ class FleetDiscovery:
                     DBInstanceIdentifier=database['identifier']
                 )
                 return response['DBInstances'][0]
-                
+
         except ClientError as e:
             self.logger.error(f"Error getting details for {database['identifier']}: {e}")
             return {}

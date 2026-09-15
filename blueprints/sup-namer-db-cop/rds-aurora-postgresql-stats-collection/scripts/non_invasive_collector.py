@@ -29,10 +29,10 @@ class NonInvasiveCollector:
         self.rds_client = boto3.client('rds', region_name=region)
         self.cloudwatch_client = boto3.client('cloudwatch', region_name=region)
         self.pi_client = boto3.client('pi', region_name=region)
-        
+
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Setup logging
         logging.basicConfig(
             level=logging.INFO,
@@ -72,7 +72,7 @@ class NonInvasiveCollector:
                 return self._collect_cluster_config(db_id, db_type)
             else:
                 return self._collect_rds_instance_config(db_id)
-                
+
         except ClientError as e:
             self.logger.error(f"Error collecting configuration for {db_id}: {e}")
             raise
@@ -232,7 +232,7 @@ class NonInvasiveCollector:
                         'cluster_type': 'multi_az_db_cluster'
                     }
                 }
-            
+
             config_data = {
                 'instance': {
                     'identifier': instance['DBInstanceIdentifier'],
@@ -262,9 +262,9 @@ class NonInvasiveCollector:
                     'is_read_replica': bool(instance.get('ReadReplicaSourceDBInstanceIdentifier'))
                 }
             }
-            
+
             return config_data
-            
+
         except ClientError as e:
             self.logger.error(f"Error collecting RDS instance configuration for {instance_id}: {e}")
             raise
@@ -369,10 +369,10 @@ class NonInvasiveCollector:
             db_id = database_info['identifier']
             db_type = database_info['type']
             self.logger.info(f"Collecting CloudWatch metrics for {db_type}: {db_id}")
-            
+
             end_time = datetime.utcnow()
             start_time = end_time - timedelta(days=days)
-            
+
             # Choose granularity: 5-min for ≤7 days, 1-hour for ≤30 days, 1-day beyond
             if days <= 7:
                 period = 600    # 10-minute: 1008 points for 7 days (limit is 1440)
@@ -380,9 +380,9 @@ class NonInvasiveCollector:
                 period = 3600   # 1-hour: 720 points max
             else:
                 period = 86400  # 1-day
-            
+
             self.logger.info(f"Using period of {period} seconds ({period//60}min) for {days} days of data")
-            
+
             # Aurora CloudWatch metrics
             aurora_metrics = [
                 # Performance metrics
@@ -410,7 +410,7 @@ class NonInvasiveCollector:
                 # System metrics
                 'EngineUptime', 'ServerlessDatabaseCapacity'
             ]
-            
+
             # RDS instance metrics
             rds_metrics = [
                 'CPUUtilization', 'DatabaseConnections', 'FreeableMemory',
@@ -420,7 +420,7 @@ class NonInvasiveCollector:
                 'MaximumUsedTransactionIDs', 'OldestReplicationSlotLag',
                 'ReplicationSlotDiskUsage', 'TransactionLogsDiskUsage', 'TransactionLogsGeneration'
             ]
-            
+
             # Select appropriate metrics and CW dimension based on database type
             if db_type == 'aurora_cluster':
                 metrics_to_collect = aurora_metrics
@@ -447,9 +447,9 @@ class NonInvasiveCollector:
                 metrics_to_collect = rds_metrics
                 dimension_name = 'DBInstanceIdentifier'
                 cw_id = db_id
-            
+
             metrics_data = {}
-            
+
             for metric_name in metrics_to_collect:
                 try:
                     response = self.cloudwatch_client.get_metric_statistics(
@@ -466,17 +466,17 @@ class NonInvasiveCollector:
                         Period=period,  # Dynamic period based on time range
                         Statistics=['Average', 'Maximum', 'Minimum']
                     )
-                    
+
                     if response['Datapoints']:
                         metrics_data[metric_name] = {
                             'datapoints': sorted(response['Datapoints'], key=lambda x: x['Timestamp']),
                             'unit': response['Datapoints'][0]['Unit']
                         }
-                        
+
                 except ClientError as e:
                     self.logger.warning(f"Could not collect metric {metric_name}: {e}")
                     continue
-            
+
             # correlation_categories: type-aware — Aurora metrics differ from RDS
             if db_type == 'aurora_cluster':
                 correlation_categories = {
@@ -514,7 +514,7 @@ class NonInvasiveCollector:
                 'metrics': metrics_data,
                 'correlation_categories': correlation_categories,
             }
-            
+
         except ClientError as e:
             self.logger.error(f"Error collecting CloudWatch metrics: {e}")
             raise
@@ -525,7 +525,7 @@ class NonInvasiveCollector:
             db_id = database_info['identifier']
             db_type = database_info['type']
             self.logger.info(f"Collecting Performance Insights data for {db_type}: {db_id}")
-            
+
             # Get instances to find PI-enabled ones
             if db_type in ('aurora_cluster', 'rds_multiaz_cluster'):
                 # Both cluster types: enumerate member instances via DBClusterIdentifier filter.
@@ -546,19 +546,19 @@ class NonInvasiveCollector:
                 )
                 instance = instance_response['DBInstances'][0]
                 pi_instances = [instance] if instance.get('PerformanceInsightsEnabled', False) else []
-            
+
             if not pi_instances:
                 self.logger.warning(f"No Performance Insights enabled instances found for {db_id}")
                 return {}
-            
+
             pi_data = {}
             end_time = datetime.utcnow()
             start_time = end_time - timedelta(days=days)
-            
+
             for instance in pi_instances:
                 instance_id = instance['DBInstanceIdentifier']
                 resource_id = instance['DbiResourceId']
-                
+
                 try:
                     # Define metrics to collect — os.diskIO.auroraStorage.* only available for Aurora
                     common_pi_metrics = [
@@ -586,15 +586,15 @@ class NonInvasiveCollector:
                         'os.diskIO.auroraStorage.diskQueueDepth.avg',
                     ]
                     all_metrics = common_pi_metrics + (aurora_pi_metrics if db_type == 'aurora_cluster' else [])
-                    
+
                     # Split metrics into batches of 15 (API limit)
                     batch_size = 15
                     metrics_response = {'MetricList': []}
-                    
+
                     for i in range(0, len(all_metrics), batch_size):
                         batch = all_metrics[i:i + batch_size]
                         metric_queries = [{'Metric': m} for m in batch]
-                        
+
                         batch_response = self.pi_client.get_resource_metrics(
                             ServiceType='RDS',
                             Identifier=resource_id,
@@ -603,11 +603,11 @@ class NonInvasiveCollector:
                             EndTime=end_time,
                             PeriodInSeconds=3600
                         )
-                        
+
                         # Merge batch results
                         if 'MetricList' in batch_response:
                             metrics_response['MetricList'].extend(batch_response['MetricList'])
-                    
+
                     # Top wait events — db.load.avg grouped by wait event, top 10
                     top_waits_response = self.pi_client.get_resource_metrics(
                         ServiceType='RDS',
@@ -745,21 +745,21 @@ class NonInvasiveCollector:
                         'correlation_categories': {
                             'performance': ['db.load.avg', 'db.load.cpu.avg', 'db.load.non_cpu.avg'],
                             'cpu': ['os.cpuUtilization.user.avg', 'os.cpuUtilization.system.avg', 'os.cpuUtilization.wait.avg'],
-                            'io': ['os.diskIO.auroraStorage.readLatency.avg', 'os.diskIO.auroraStorage.writeLatency.avg', 
+                            'io': ['os.diskIO.auroraStorage.readLatency.avg', 'os.diskIO.auroraStorage.writeLatency.avg',
                                    'os.diskIO.auroraStorage.readIOsPS.avg', 'os.diskIO.auroraStorage.writeIOsPS.avg'],
-                            'transactions': ['db.Transactions.xact_commit.avg', 'db.Transactions.xact_rollback.avg', 
+                            'transactions': ['db.Transactions.xact_commit.avg', 'db.Transactions.xact_rollback.avg',
                                            'db.Transactions.active_transactions.avg', 'db.Transactions.blocked_transactions.avg'],
                             'cache': ['db.Cache.blks_hit.avg', 'db.IO.blks_read.avg'],
                             'connections': ['db.User.numbackends.avg', 'db.state.idle_in_transaction_count.avg']
                         }
                     }
-                    
+
                 except ClientError as e:
                     self.logger.warning(f"Could not collect PI data for {instance_id}: {e}")
                     continue
-            
+
             return pi_data
-            
+
         except ClientError as e:
             self.logger.error(f"Error collecting Performance Insights data: {e}")
             return {}
@@ -769,7 +769,7 @@ class NonInvasiveCollector:
         db_id = database_info['identifier']
         db_type = database_info['type']
         self.logger.info(f"Starting non-invasive data collection for {db_type}: {db_id}")
-        
+
         collected_data = {
             'collection_timestamp': datetime.utcnow().isoformat(),
             'database_id': db_id,
@@ -778,20 +778,20 @@ class NonInvasiveCollector:
             'collection_type': 'non_invasive',
             'wal_framework': database_info['wal_framework']
         }
-        
+
         try:
             # Collect database configuration
             collected_data['configuration'] = self.collect_database_configuration(database_info)
-            
+
             # Collect configuration parameters (pg_settings equivalent via RDS API)
             collected_data['configuration_parameters'] = self.collect_configuration_parameters(database_info)
-            
+
             # Collect CloudWatch metrics
             collected_data['cloudwatch_metrics'] = self.collect_cloudwatch_metrics(database_info)
-            
+
             # Collect Performance Insights data
             collected_data['performance_insights'] = self.collect_performance_insights(database_info)
-            
+
             # Apply PII redaction before writing to disk
             if not getattr(self, '_skip_redaction', False):
                 try:
@@ -809,15 +809,15 @@ class NonInvasiveCollector:
                     redactor = PiiRedactor()
                     collected_data, _ = redactor.redact(collected_data)
                     self.logger.info("PII redaction applied")
-            
+
             # Save to file
             output_file = os.path.join(self.output_dir, f"{db_id}_non_invasive_data.json")
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(collected_data, f, indent=2, default=str)
-            
+
             self.logger.info(f"Data collection completed for {db_id}. Output saved to {output_file}")
             return collected_data
-            
+
         except Exception as e:
             self.logger.error(f"Error during data collection for {db_id}: {e}")
             raise
@@ -825,17 +825,17 @@ class NonInvasiveCollector:
     def collect_fleet_data(self, fleet: List[Dict[str, Any]], max_workers: int = 4) -> List[Dict[str, Any]]:
         """Collect data for multiple databases in parallel."""
         self.logger.info(f"Starting fleet data collection for {len(fleet)} databases")
-        
+
         results = []
         failed_databases = []
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all collection tasks
             future_to_db = {
-                executor.submit(self.collect_database_data, db_info): db_info 
+                executor.submit(self.collect_database_data, db_info): db_info
                 for db_info in fleet
             }
-            
+
             # Process completed tasks
             for future in as_completed(future_to_db):
                 db_info = future_to_db[future]
@@ -846,7 +846,7 @@ class NonInvasiveCollector:
                 except Exception as e:
                     self.logger.error(f"❌ Failed collection for {db_info['identifier']}: {e}")
                     failed_databases.append(db_info['identifier'])
-        
+
         # Generate fleet summary
         fleet_summary = {
             'collection_timestamp': datetime.utcnow().isoformat(),
@@ -857,38 +857,38 @@ class NonInvasiveCollector:
             'failed_databases': failed_databases,
             'collection_type': 'fleet_non_invasive'
         }
-        
+
         # Save fleet summary
         summary_file = os.path.join(self.output_dir, 'fleet_collection_summary.json')
         with open(summary_file, 'w', encoding='utf-8') as f:
             json.dump(fleet_summary, f, indent=2, default=str)
-        
+
         self.logger.info(f"Fleet collection completed. {len(results)}/{len(fleet)} successful")
         return results
 
 
 def main():
     parser = argparse.ArgumentParser(description='Non-invasive PostgreSQL data collector')
-    
+
     # Single database options
     parser.add_argument('--database-id', help='Specific database identifier (cluster or instance)')
     parser.add_argument('--database-type', choices=['aurora_cluster', 'rds_instance', 'rds_multiaz_cluster'],
                        help='Type of database (required with --database-id)')
-    
+
     # Fleet options
     parser.add_argument('--fleet', action='store_true', help='Collect data for entire fleet')
-    parser.add_argument('--include-aurora', action='store_true', default=True, 
+    parser.add_argument('--include-aurora', action='store_true', default=True,
                        help='Include Aurora clusters in fleet discovery')
-    parser.add_argument('--include-rds', action='store_true', default=True, 
+    parser.add_argument('--include-rds', action='store_true', default=True,
                        help='Include RDS instances in fleet discovery')
     parser.add_argument('--include-databases', nargs='*', default=[],
                        help='Specific database identifiers to include (whitelist)')
-    parser.add_argument('--exclude-databases', nargs='*', default=[], 
+    parser.add_argument('--exclude-databases', nargs='*', default=[],
                        help='Database identifiers to exclude from collection')
     parser.add_argument('--identifier-pattern', help='Only include databases matching this pattern')
     parser.add_argument('--required-tags', nargs='*', default=[],
                        help='Required tags in key=value format (use key=* for any value)')
-    
+
     # Common options
     parser.add_argument('--region', required=True, help='AWS region')
     parser.add_argument('--output-dir', default='./data', help='Output directory for collected data')
@@ -897,36 +897,36 @@ def main():
     parser.add_argument('--no-redact', action='store_true',
                         help='Skip PII redaction (endpoints, client IPs, KMS ARNs). '
                              'Use only if you need the raw data for internal analysis.')
-    
+
     args = parser.parse_args()
-    
+
     # Validate arguments
     if not args.fleet and not args.database_id:
         print("❌ Either --fleet or --database-id must be specified")
         return 1
-    
+
     if args.database_id and not args.database_type:
         print("❌ --database-type is required when using --database-id")
         return 1
-    
+
     try:
         collector = NonInvasiveCollector(args.region, args.output_dir)
         collector._skip_redaction = args.no_redact
-        
+
         if args.fleet:
             # Fleet collection
             print(f"🔍 Discovering PostgreSQL databases in region {args.region}...")
-            
+
             discovery = FleetDiscovery(args.region)
             fleet = discovery.discover_fleet(
                 include_aurora=args.include_aurora,
                 include_rds=args.include_rds
             )
-            
+
             if not fleet:
                 print("❌ No PostgreSQL databases found in the region")
                 return 1
-            
+
             # Apply filters
             filters = {}
             if args.include_databases:
@@ -945,19 +945,19 @@ def main():
                     else:
                         tag_dict[tag] = '*'  # Any value
                 filters['required_tags'] = tag_dict
-            
+
             if filters:
                 fleet = discovery.filter_fleet(fleet, filters)
-            
+
             if not fleet:
                 print("❌ No databases remaining after applying filters")
                 return 1
-            
+
             print(f"📊 Starting data collection for {len(fleet)} databases...")
             results = collector.collect_fleet_data(fleet, args.max_workers)
-            
+
             print(f"✅ Fleet data collection completed. {len(results)}/{len(fleet)} successful")
-            
+
         else:
             # Single database collection
             database_info = {
@@ -969,17 +969,17 @@ def main():
                     else 'RDS_PostgreSQL_CustomLens_v1.json'
                 )
             }
-            
+
             collector.collect_database_data(database_info)
             print(f"✅ Data collection completed successfully for {args.database_type}: {args.database_id}")
-        
+
     except NoCredentialsError:
         print("❌ AWS credentials not found. Please configure AWS CLI or set environment variables.")
         return 1
     except Exception as e:
         print(f"❌ Error during data collection: {e}")
         return 1
-    
+
     return 0
 
 

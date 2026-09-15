@@ -24,7 +24,7 @@ from non_invasive_collector import NonInvasiveCollector
 
 
 class InvasiveCollector(NonInvasiveCollector):
-    def __init__(self, region: str, db_host: str, db_user: str, db_password: Optional[str] = None, 
+    def __init__(self, region: str, db_host: str, db_user: str, db_password: Optional[str] = None,
                  db_port: int = 5432, db_name: str = 'postgres', output_dir: str = "./data",
                  db_secret_arn: Optional[str] = None):
         super().__init__(region, output_dir)
@@ -35,7 +35,7 @@ class InvasiveCollector(NonInvasiveCollector):
         self.db_port = db_port
         self.db_name = db_name
         self.db_secret_arn = db_secret_arn
-        
+
         # Test database connection
         self._test_connection()
 
@@ -65,40 +65,40 @@ class InvasiveCollector(NonInvasiveCollector):
         """Collect database-level statistics."""
         try:
             self.logger.info("Collecting database statistics")
-            
+
             conn = self._get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             stats_data = {}
-            
+
             # Database size and object counts
             cursor.execute("""
-                SELECT 
+                SELECT
                     datname,
                     pg_size_pretty(pg_database_size(datname)) as size,
                     pg_database_size(datname) as size_bytes
-                FROM pg_database 
+                FROM pg_database
                 WHERE datistemplate = false;
             """)
             stats_data['database_sizes'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Table statistics
             cursor.execute("""
-                SELECT 
+                SELECT
                     schemaname,
                     tablename,
                     attname,
                     n_distinct,
                     correlation
-                FROM pg_stats 
+                FROM pg_stats
                 WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
                 ORDER BY schemaname, tablename, attname;
             """)
             stats_data['table_statistics'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Index usage statistics
             cursor.execute("""
-                SELECT 
+                SELECT
                     schemaname,
                     relname as tablename,
                     indexrelname as indexname,
@@ -109,10 +109,10 @@ class InvasiveCollector(NonInvasiveCollector):
                 ORDER BY schemaname, relname, indexrelname;
             """)
             stats_data['index_usage'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Table I/O statistics
             cursor.execute("""
-                SELECT 
+                SELECT
                     schemaname,
                     relname,
                     seq_scan,
@@ -133,42 +133,42 @@ class InvasiveCollector(NonInvasiveCollector):
                 ORDER BY schemaname, relname;
             """)
             stats_data['table_io'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Connection and activity statistics
             cursor.execute("""
-                SELECT 
+                SELECT
                     state,
                     COUNT(*) as count
-                FROM pg_stat_activity 
+                FROM pg_stat_activity
                 GROUP BY state;
             """)
             stats_data['connection_states'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Lock statistics
             cursor.execute("""
-                SELECT 
+                SELECT
                     mode,
                     COUNT(*) as count
-                FROM pg_locks 
+                FROM pg_locks
                 GROUP BY mode;
             """)
             stats_data['lock_modes'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Background writer statistics (handle version differences)
             try:
                 # Get PostgreSQL version to determine which columns are available
                 cursor.execute("SELECT version();")
                 version_info = cursor.fetchone()['version']
-                
+
                 # Extract major version number
                 import re
                 version_match = re.search(r'PostgreSQL (\d+)', version_info)
                 major_version = int(version_match.group(1)) if version_match else 0
-                
+
                 if major_version >= 17:
                     # PostgreSQL 17+: checkpoint stats moved to pg_stat_checkpointer
                     cursor.execute("""
-                        SELECT 
+                        SELECT
                             buffers_clean,
                             maxwritten_clean,
                             buffers_alloc,
@@ -177,11 +177,11 @@ class InvasiveCollector(NonInvasiveCollector):
                     """)
                     bgwriter_result = cursor.fetchone()
                     bgwriter_data = dict(bgwriter_result) if bgwriter_result else {}
-                    
+
                     # Try to get checkpoint stats from pg_stat_checkpointer
                     try:
                         cursor.execute("""
-                            SELECT 
+                            SELECT
                                 num_timed as checkpoints_timed,
                                 num_requested as checkpoints_req,
                                 write_time as checkpoint_write_time,
@@ -195,12 +195,12 @@ class InvasiveCollector(NonInvasiveCollector):
                             bgwriter_data.update(dict(checkpointer_result))
                     except Exception:
                         self.logger.warning("pg_stat_checkpointer not available")
-                    
+
                     stats_data['bgwriter'] = bgwriter_data
                 else:
                     # PostgreSQL < 17: all stats in pg_stat_bgwriter
                     cursor.execute("""
-                        SELECT 
+                        SELECT
                             checkpoints_timed,
                             checkpoints_req,
                             checkpoint_write_time,
@@ -216,13 +216,13 @@ class InvasiveCollector(NonInvasiveCollector):
                     """)
                     bgwriter_result = cursor.fetchone()
                     stats_data['bgwriter'] = dict(bgwriter_result) if bgwriter_result else {}
-                    
+
             except Exception as e:
                 self.logger.warning(f"Could not collect bgwriter stats: {str(e)}")
                 # Fallback to minimal columns that exist in all versions
                 try:
                     cursor.execute("""
-                        SELECT 
+                        SELECT
                             buffers_clean,
                             buffers_alloc
                         FROM pg_stat_bgwriter;
@@ -232,32 +232,32 @@ class InvasiveCollector(NonInvasiveCollector):
                 except Exception as e2:
                     self.logger.warning(f"Could not collect bgwriter stats with fallback: {str(e2)}")
                     stats_data['bgwriter'] = {'error': str(e2)}
-            
+
             cursor.close()
             conn.close()
-            
+
             return stats_data
-            
+
         except Exception as e:
             self.logger.error(f"Error collecting database statistics: {e}")
             raise
 
     def collect_configuration_parameters(self, database_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """Collect PostgreSQL configuration parameters via direct DB connection.
-        
+
         The database_info parameter is accepted for compatibility with the
         parent class (NonInvasiveCollector) but is not used — the invasive
         collector already has a DB connection and queries pg_settings directly.
         """
         try:
             self.logger.info("Collecting configuration parameters")
-            
+
             conn = self._get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             # Get all configuration parameters
             cursor.execute("""
-                SELECT 
+                SELECT
                     name,
                     setting,
                     unit,
@@ -273,17 +273,17 @@ class InvasiveCollector(NonInvasiveCollector):
                 FROM pg_settings
                 ORDER BY category, name;
             """)
-            
+
             parameters = [dict(row) for row in cursor.fetchall()]
-            
+
             cursor.close()
             conn.close()
-            
+
             return {
                 'parameters': parameters,
                 'collection_timestamp': datetime.utcnow().isoformat()
             }
-            
+
         except Exception as e:
             self.logger.error(f"Error collecting configuration parameters: {e}")
             raise
@@ -296,15 +296,15 @@ class InvasiveCollector(NonInvasiveCollector):
         """
         try:
             self.logger.info("Collecting schema information")
-            
+
             conn = self._get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             schema_data = {}
-            
+
             # Tables and their sizes — exclude extension-owned objects
             cursor.execute("""
-                SELECT 
+                SELECT
                     t.schemaname,
                     t.tablename,
                     pg_size_pretty(pg_total_relation_size(t.schemaname||'.'||t.tablename)) as total_size,
@@ -329,16 +329,16 @@ class InvasiveCollector(NonInvasiveCollector):
                 ORDER BY pg_total_relation_size(t.schemaname||'.'||t.tablename) DESC;
             """)
             schema_data['tables'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Indexes and their sizes
             cursor.execute("""
-                SELECT 
+                SELECT
                     schemaname,
                     tablename,
                     indexname,
                     pg_size_pretty(pg_relation_size(schemaname||'.'||indexname)) as index_size,
                     pg_relation_size(schemaname||'.'||indexname) as index_size_bytes
-                FROM pg_indexes 
+                FROM pg_indexes
                 WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
                   AND tablename NOT IN (
                     SELECT c.relname FROM pg_class c
@@ -348,10 +348,10 @@ class InvasiveCollector(NonInvasiveCollector):
                 ORDER BY pg_relation_size(schemaname||'.'||indexname) DESC;
             """)
             schema_data['indexes'] = [dict(row) for row in cursor.fetchall()]
-            
+
             # Column information
             cursor.execute("""
-                SELECT 
+                SELECT
                     table_schema,
                     table_name,
                     column_name,
@@ -368,12 +368,12 @@ class InvasiveCollector(NonInvasiveCollector):
                 ORDER BY table_schema, table_name, ordinal_position;
             """)
             schema_data['columns'] = [dict(row) for row in cursor.fetchall()]
-            
+
             cursor.close()
             conn.close()
-            
+
             return schema_data
-            
+
         except Exception as e:
             self.logger.error(f"Error collecting schema information: {e}")
             raise
@@ -382,29 +382,29 @@ class InvasiveCollector(NonInvasiveCollector):
         """Collect query performance data using pg_stat_statements if available."""
         try:
             self.logger.info("Collecting query performance data")
-            
+
             conn = self._get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             # Check if pg_stat_statements is available
             cursor.execute("""
                 SELECT EXISTS (
                     SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
                 ) as has_pg_stat_statements;
             """)
-            
+
             has_pg_stat_statements = cursor.fetchone()['has_pg_stat_statements']
-            
+
             query_data = {
                 'has_pg_stat_statements': has_pg_stat_statements,
                 'collection_timestamp': datetime.utcnow().isoformat()
             }
-            
+
             if has_pg_stat_statements:
                 # Get PostgreSQL version to determine column names
                 cursor.execute("SHOW server_version_num;")
                 version_num = int(cursor.fetchone()['server_version_num'])
-                
+
                 # PostgreSQL 13+ uses total_exec_time, older versions use total_time
                 # Whitelist the column name to prevent any SQL injection
                 time_column = 'total_exec_time' if version_num >= 130000 else 'total_time'
@@ -441,23 +441,23 @@ class InvasiveCollector(NonInvasiveCollector):
                 )
                 cursor.execute(slowest_sql)
                 query_data['slowest_queries'] = [dict(row) for row in cursor.fetchall()]
-            
+
             cursor.close()
             conn.close()
-            
+
             return query_data
-            
+
         except Exception as e:
             self.logger.error(f"Error collecting query performance data: {e}")
             return {'error': str(e)}
 
     def collect_pg_health_insights(self, skip_security: bool = False) -> Dict[str, Any]:
         """Collect comprehensive PostgreSQL health insights across 9 sections.
-        
+
         Args:
             skip_security: If True, skip security-related queries (user roles, privileges,
                           SSL, passwords, sensitive columns, RLS, audit config).
-        
+
         Uses validated SQL queries from pg_health_queries.py. Version-aware branching
         for PG17+ checkpoint stats and pg_stat_statements column differences.
         """
@@ -504,18 +504,18 @@ class InvasiveCollector(NonInvasiveCollector):
                     locals()[name] = getattr(mod, name)
 
         self.logger.info("Collecting PostgreSQL health insights (9 sections)")
-        
+
         conn = self._get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
+
         # Detect version and extensions once
         cursor.execute("SELECT current_setting('server_version_num')::int AS ver")
         pg_version = cursor.fetchone()['ver']
-        
+
         cursor.execute("SELECT extname FROM pg_extension")
         extensions = {row['extname'] for row in cursor.fetchall()}
         has_pg_stat_statements = 'pg_stat_statements' in extensions
-        
+
         # Determine deployment type from the API-detected db type.
         # Do NOT use hostname heuristics — both Aurora and RDS Multi-AZ DB Clusters
         # use the .cluster-xxx endpoint format, making hostname patterns unreliable.
@@ -526,7 +526,7 @@ class InvasiveCollector(NonInvasiveCollector):
             deployment_type = 'RDS Multi-AZ DB Cluster'
         else:
             deployment_type = 'RDS'
-        
+
         def _run(sql, **kwargs):
             """Execute query safely, return list of dicts or [] on error."""
             try:
@@ -540,20 +540,20 @@ class InvasiveCollector(NonInvasiveCollector):
                 except Exception:
                     pass
                 return []
-        
+
         result = {
             'collection_timestamp': datetime.utcnow().isoformat(),
             'pg_version': pg_version,
             'deployment_type': deployment_type,
             'has_pg_stat_statements': has_pg_stat_statements,
         }
-        
+
         # Section 1: Overview
         result['overview'] = {
             'server_info': _run(OVERVIEW_SERVER_INFO),
             'extension_inventory': _run(OVERVIEW_EXTENSION_INVENTORY),
         }
-        
+
         # Section 2: Configuration
         if skip_security:
             result['configuration'] = {
@@ -572,7 +572,7 @@ class InvasiveCollector(NonInvasiveCollector):
                 'audit_config': _run(CONFIG_AUDIT_CONFIG),
                 'db_role_overrides': _run(CONFIG_DB_ROLE_OVERRIDES),
             }
-        
+
         # Section 3: Activity
         result['activity'] = {
             'connection_summary': _run(ACTIVITY_CONNECTION_SUMMARY),
@@ -582,7 +582,7 @@ class InvasiveCollector(NonInvasiveCollector):
             'client_analysis': _run(ACTIVITY_CLIENT_ANALYSIS),
             'connection_churn': _run(ACTIVITY_CONNECTION_CHURN),
         }
-        
+
         # Section 4: Replication
         result['replication'] = {
             'replication_info': _run(REPLICATION_INFO, deployment_type=deployment_type),
@@ -590,21 +590,21 @@ class InvasiveCollector(NonInvasiveCollector):
             'sync_replication_config': _run(REPLICATION_SYNC_CONFIG),
             'logical_replication_slots': _run(REPLICATION_LOGICAL_SLOTS),
         }
-        
+
         # Section 5: Data Footprint
         result['data_footprint'] = {
             'database_sizes': _run(DATA_DATABASE_SIZES),
             'wal_directory': _run(DATA_WAL_DIRECTORY),
         }
-        
+
         # Section 6: Performance (version-aware + extension-aware)
         checkpoint_stats = _run(PERF_CHECKPOINT_STATS_PG17) if pg_version >= 170000 else _run(PERF_CHECKPOINT_STATS_PRE17)
-        
+
         temp_file_queries = _run(PERF_TEMP_FILE_QUERIES) if has_pg_stat_statements else []
         query_perf = _run(PERF_QUERY_ANALYSIS_PG17) if (has_pg_stat_statements and pg_version >= 170000) else (
             _run(PERF_QUERY_ANALYSIS_PRE17) if has_pg_stat_statements else []
         )
-        
+
         result['performance'] = {
             'checkpoint_stats': checkpoint_stats,
             'bgwriter_stats': _run(PERF_BGWRITER_STATS),
@@ -621,7 +621,7 @@ class InvasiveCollector(NonInvasiveCollector):
             'temp_file_heavy_queries': temp_file_queries,
             'query_performance_analysis': query_perf,
         }
-        
+
         # Section 7: Maintenance
         result['maintenance'] = {
             'database_integrity': _run(MAINT_DATABASE_INTEGRITY),
@@ -630,7 +630,7 @@ class InvasiveCollector(NonInvasiveCollector):
             'materialized_view_freshness': _run(MAINT_MATERIALIZED_VIEWS),
             'table_vacuum_stats': _run(MAINT_TABLE_VACUUM_STATS),
         }
-        
+
         # Section 8: Optimization
         result['optimization'] = {
             'index_statistics': _run(OPT_INDEX_STATISTICS),
@@ -645,16 +645,16 @@ class InvasiveCollector(NonInvasiveCollector):
             'trigger_analysis': _run(OPT_TRIGGER_ANALYSIS),
             'seq_scan_candidates': _run(OPT_SEQ_SCAN_CANDIDATES),
         }
-        
+
         # Section 9: Summary
         result['summary'] = {
             'core_health_metrics': _run(SUMMARY_CORE_HEALTH),
             'critical_system_metrics': _run(SUMMARY_CRITICAL_SYSTEM),
         }
-        
+
         cursor.close()
         conn.close()
-        
+
         self.logger.info(f"PostgreSQL health insights collected: {sum(len(v) if isinstance(v, list) else len(v) for v in result.values() if isinstance(v, (list, dict)))} data points across 9 sections")
         return result
 
@@ -778,55 +778,55 @@ class InvasiveCollector(NonInvasiveCollector):
                 'error': str(e),
                 'missing_requirements': ['Failed to check prerequisites'],
             }
-    
+
     def check_local_postgresql(self) -> bool:
         """Check if local PostgreSQL is installed and running."""
         try:
             result = subprocess.run(['which', 'psql'], capture_output=True, text=True)
             if result.returncode != 0:
                 return False
-            
+
             # Check if PostgreSQL service is running
             result = subprocess.run(['systemctl', 'is-active', 'postgresql'], capture_output=True, text=True)
             return result.returncode == 0
         except Exception:
             return False
-    
+
     def setup_local_postgresql(self):
         """Setup local PostgreSQL for PGSnapper analysis."""
         try:
             self.logger.info("Setting up local PostgreSQL for PGSnapper analysis")
-            
+
             # Check if PostgreSQL is already running
             if self.check_local_postgresql():
                 self.logger.info("PostgreSQL already running")
                 return
-            
+
             # Start PostgreSQL service (should be installed by CloudFormation)
             subprocess.run(['sudo', 'systemctl', 'start', 'postgresql'], check=True)
             subprocess.run(['sudo', 'systemctl', 'enable', 'postgresql'], check=True)
-            
+
             self.logger.info("PostgreSQL service started")
-            
+
         except Exception as e:
             self.logger.error(f"Error setting up local PostgreSQL: {e}")
             raise
-    
+
     def check_pgsnapper_installation(self) -> Dict[str, Any]:
         """Check if PGSnapper is properly installed."""
         pgsnapper_script = '/home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper/pg_perf_stat_snapper.py'
         loader_script = '/home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper/pg_perf_stat_loader.py'
         sql_dir = '/home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper/SQLs'
-        
+
         status = {
             'pgsnapper_script': os.path.exists(pgsnapper_script),
             'loader_script': os.path.exists(loader_script),
             'sql_queries': os.path.exists(sql_dir),
             'local_postgresql': self.check_local_postgresql()
         }
-        
+
         status['ready'] = all(status.values())
-        
+
         # Add detailed error messages
         if not status['ready']:
             missing_details = []
@@ -839,9 +839,9 @@ class InvasiveCollector(NonInvasiveCollector):
             if not status['local_postgresql']:
                 missing_details.append("Local PostgreSQL not installed or not running. Install: sudo yum install postgresql15 postgresql15-server")
             status['missing_details'] = missing_details
-        
+
         return status
-    
+
     @staticmethod
     def _validate_identifier(value: str, name: str) -> str:
         """Validate that a value contains only safe characters for use in subprocess args."""
@@ -944,42 +944,42 @@ fi
                         'Re-run enable-invasive-collection.sh with correct parameters'
                     ]
                 }
-            
+
             # Only reaches here if snapshot succeeded — install cron
             cron_schedule = f"*/{interval_minutes} * * * *" if interval_minutes < 60 else f"0 */{interval_minutes//60} * * *"
             cron_entry = f"{cron_schedule} {wrapper_script}\n"
-            
+
             # Try to find crontab command
             crontab_cmd = None
             for path in ['/usr/bin/crontab', '/bin/crontab']:
                 if os.path.exists(path):
                     crontab_cmd = path
                     break
-            
+
             if not crontab_cmd:
                 # Fallback: install cronie if not available
                 self.logger.warning("crontab not found, attempting to install cronie")
                 subprocess.run(['sudo', 'yum', 'install', '-y', 'cronie'], check=True)  # nosemgrep: dangerous-subprocess-use-audit
                 crontab_cmd = '/usr/bin/crontab'
-            
+
             result = subprocess.run([crontab_cmd, '-l'], capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-audit
             existing_cron = result.stdout if result.returncode == 0 else ""
             new_cron = "\n".join([line for line in existing_cron.split("\n") if 'pgsnapper_snap.sh' not in line])
             new_cron += "\n" + cron_entry
 
             subprocess.run([crontab_cmd, '-'], input=new_cron, text=True, check=True)  # nosemgrep: dangerous-subprocess-use-audit
-            
+
             # Ensure crond service is running
             subprocess.run(['sudo', 'systemctl', 'enable', 'crond'], capture_output=True)  # nosemgrep: dangerous-subprocess-use-audit
             subprocess.run(['sudo', 'systemctl', 'start', 'crond'], capture_output=True)  # nosemgrep: dangerous-subprocess-use-audit
-            
+
             self.logger.info(f"PGSnapper cron job installed: {cron_schedule}")
             return f'{output_dir}/{self.db_host}/{self.db_name}'
-            
+
         except Exception as e:
             self.logger.error(f"Error setting up PGSnapper cron: {e}")
             raise
-    
+
     @staticmethod
     def _format_remaining_time(remaining_days: float) -> str:
         """Format remaining wait time in human-readable units."""
@@ -996,28 +996,28 @@ fi
         try:
             # PGSnapper creates subdirectories: output_dir/hostname/dbname/
             actual_output_dir = f'{output_dir}/{self.db_host}/{self.db_name}'
-            
+
             if not os.path.exists(actual_output_dir):
                 return {'ready': False, 'days': 0, 'snapshots': 0, 'message': 'No data collected yet'}
-            
+
             snap_files = []
             for root, dirs, files in os.walk(actual_output_dir):
                 snap_files.extend([os.path.join(root, f) for f in files if f.endswith('.csv')])
-            
+
             if not snap_files:
                 return {'ready': False, 'days': 0, 'snapshots': 0, 'message': 'No snapshots found'}
-            
+
             file_times = [os.path.getmtime(f) for f in snap_files]
             oldest_time = datetime.fromtimestamp(min(file_times))
             newest_time = datetime.fromtimestamp(max(file_times))
-            
+
             # Measure time since first snapshot was created (not file span —
             # PGSnapper may overwrite files, making newest == oldest)
             now = datetime.now()
             days_since_first = (now - oldest_time).total_seconds() / 86400
-            
+
             ready = days_since_first >= min_days
-            
+
             return {
                 'ready': ready,
                 'days': round(days_since_first, 2),
@@ -1026,22 +1026,22 @@ fi
                 'newest_snapshot': newest_time.isoformat(),
                 'message': f'{days_since_first:.1f} days of data collected ({len(snap_files)} snapshots)' if ready else self._format_remaining_time(min_days - days_since_first) if days_since_first < min_days else f'Only {len(snap_files)} snapshot(s) found, need at least {min_snapshots}'
             }
-            
+
         except Exception as e:
             self.logger.error(f"Error checking PGSnapper data age: {e}")
             return {'ready': False, 'error': str(e)}
-    
+
     def load_pgsnapper_data(self, output_dir: str) -> str:
         """Load PGSnapper data into local PostgreSQL for analysis."""
         try:
             self.logger.info("Loading PGSnapper data into local PostgreSQL")
-            
+
             # Ensure local PostgreSQL is running
             self.setup_local_postgresql()
-            
+
             # Create analysis database
             analysis_db = f"pgsnapper_analysis_{int(datetime.now().timestamp())}"
-            
+
             # Connect as postgres user to create database
             self._validate_identifier(analysis_db, 'analysis_db')
             create_db_cmd = [
@@ -1053,10 +1053,10 @@ fi
             if result.returncode != 0:
                 self.logger.error(f"Failed to create analysis database: {result.stderr}")
                 raise Exception(f"Database creation failed: {result.stderr}")
-            
+
             # Load data using PGSnapper loader (no secret needed for localhost with trust auth)
             loader_script = '/home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper/pg_perf_stat_loader.py'
-            
+
             load_cmd = [
                 'python3', loader_script,
                 '-e', 'localhost',
@@ -1069,30 +1069,30 @@ fi
             ]
 
             result = subprocess.run(load_cmd, capture_output=True, text=True, timeout=1800)  # nosec B603 - all args are static strings or validated identifiers  # nosemgrep: dangerous-subprocess-use-audit
-            
+
             # Log loader output for debugging
             if result.stdout:
                 self.logger.info(f"PGSnapper loader output: {result.stdout}")
             if result.stderr:
                 self.logger.warning(f"PGSnapper loader stderr: {result.stderr}")
-            
+
             if result.returncode != 0:
                 self.logger.error(f"Failed to load PGSnapper data: {result.stderr}")
                 self.logger.error(f"Loader stdout: {result.stdout}")
                 raise Exception(f"Data loading failed: {result.stderr}")
-            
+
             self.logger.info(f"PGSnapper data loaded into database: {analysis_db}")
             return analysis_db
-            
+
         except Exception as e:
             self.logger.error(f"Error loading PGSnapper data: {e}")
             raise
-    
+
     def run_pgsnapper_analysis(self, analysis_db: str, min_days: float, skip_pg_stat_statements: bool = False) -> Dict[str, Any]:
         """Run analysis queries on loaded PGSnapper data."""
         try:
             self.logger.info("Running PGSnapper analysis queries")
-            
+
             # Use ALL available snapshots — the readiness gate (check_pgsnapper_data_age)
             # already ensures we have enough data. No time-based filtering here.
             self._validate_identifier(analysis_db, 'analysis_db')
@@ -1109,16 +1109,16 @@ fi
             if result.returncode != 0 or not result.stdout.strip():
                 self.logger.error("Failed to get snapshot IDs")
                 return {'error': 'No snapshots found'}
-            
+
             snap_ids = result.stdout.strip().split('|')
             begin_snap_id = snap_ids[0]
             end_snap_id = snap_ids[1]
-            
+
             if not begin_snap_id or not end_snap_id:
                 return {'error': 'No snapshots found in analysis database'}
-            
+
             self.logger.info(f"Using snapshot range: {begin_snap_id} to {end_snap_id}")
-            
+
             # Check if pg_stat_statements data exists
             check_statements_cmd = [
                 'sudo', '-u', 'postgres', 'psql',
@@ -1130,10 +1130,10 @@ fi
             stmt_count = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else 0
             if stmt_count == 0:
                 self.logger.warning("No pg_stat_statements data found - queries requiring statement history will return 0 rows")
-            
+
             analysis_results = {}
             sql_dir = '/home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper/SQLs'
-            
+
             # Detect column naming convention (old vs new PostgreSQL versions)
             check_columns_cmd = [
                 'sudo', '-u', 'postgres', 'psql',
@@ -1143,10 +1143,10 @@ fi
             ]
             result = subprocess.run(check_columns_cmd, capture_output=True, text=True, timeout=30, cwd='/tmp')  # nosec B603 B108 - cwd=/tmp is working dir only  # nosemgrep: dangerous-subprocess-use-audit
             use_fixed_queries = 'shared_blk_read_time' in result.stdout
-            
+
             # Use fixed SQL queries for newer PostgreSQL versions with different column names
             fixed_sql_dir = os.path.join(os.path.dirname(__file__), 'pgsnapper_sql_fixes')
-            
+
             # Key analysis queries from PGSnapper with expected column headers
             key_queries = {
                 'snapshots': {
@@ -1240,10 +1240,10 @@ fi
                     'columns': ['schemaname', 'funcname', 'avg_time', 'calls', 'self_time']
                 },
             }
-            
+
             if use_fixed_queries:
                 self.logger.info("Using fixed SQL queries for newer PostgreSQL version (shared_blk_read_time columns)")
-            
+
             # Queries that require pg_stat_statements data
             requires_statements = {'top_sqls_by_time', 'top_sqls_by_calls', 'top_sqls_by_cpu'}
 
@@ -1264,7 +1264,7 @@ fi
                         sql_path = sql_path_fixed
                     else:
                         sql_path = sql_path_pgsnapper
-                    
+
                     if os.path.exists(sql_path):
                         # Validate snap IDs are integers before interpolating into psql -v args
                         if not re.match(r'^\d+$', str(begin_snap_id)) or not re.match(r'^\d+$', str(end_snap_id)):
@@ -1310,11 +1310,11 @@ fi
                     else:
                         self.logger.warning(f"SQL file not found: {sql_path}")
                         analysis_results[analysis_name] = {'columns': columns, 'data': []}
-                        
+
                 except Exception as e:
                     self.logger.error(f"Error running {analysis_name}: {e}")
                     analysis_results[analysis_name] = {'columns': query_info.get('columns', []), 'data': [], 'error': str(e)}
-            
+
             return {
                 'collection_timestamp': datetime.utcnow().isoformat(),
                 'analysis_database': analysis_db,
@@ -1323,11 +1323,11 @@ fi
                 'analysis_results': analysis_results,
                 'data_format': 'structured_with_columns'
             }
-            
+
         except Exception as e:
             self.logger.error(f"Error running PGSnapper analysis: {e}")
             return {'error': str(e)}
-    
+
     def collect_pgsnapper_data(self, min_days: int = 3, snap_interval_minutes: int = 60, status_file: Optional[str] = None, skip_pg_stat_statements: bool = False) -> Dict[str, Any]:
         """Setup PGSnapper collection or analyze if enough data exists."""
         try:
@@ -1356,9 +1356,9 @@ fi
 
             # PGSnapper automatically creates subdirectories, so use base output dir
             output_dir = f'/home/ec2-user/pgperfstats/output'
-            
+
             data_status = self.check_pgsnapper_data_age(output_dir, min_days)
-            
+
             # Write status file for collect-and-share.sh to read
             if status_file:
                 status_data = {
@@ -1371,22 +1371,22 @@ fi
                 }
                 with open(status_file, 'w', encoding='utf-8') as f:
                     json.dump(status_data, f, indent=2)
-            
+
             if not data_status['ready']:
                 remaining_seconds = (min_days - data_status.get('days', 0)) * 86400
                 remaining_msg = self._format_remaining_time(remaining_seconds / 86400)
-                
+
                 # Ensure cron is running so snapshots keep accumulating
                 try:
                     self.setup_pgsnapper_cron(snap_interval_minutes)
                 except Exception:
                     pass  # Cron may already be installed
-                
+
                 self.logger.info(
                     f"PGSnapper data not ready: {data_status.get('snapshots', 0)} snapshots collected, "
                     f"need ~{remaining_msg}. Re-run this command later."
                 )
-                
+
                 return {
                     'status': 'collecting',
                     'cron_status': 'configured',
@@ -1396,15 +1396,15 @@ fi
                     'data_status': data_status,
                     'output_dir': output_dir
                 }
-            
+
             self.logger.info(f"PGSnapper data ready: {data_status['days']} days, {data_status['snapshots']} snapshots")
-            
+
             pgsnapper_script = '/home/ec2-user/pgperfstats/Code/PGPerfStatsSnapper/pg_perf_stat_snapper.py'
             env = os.environ.copy()
             # Password still needed for direct database queries (non-PGSnapper operations)
             if self.db_password:
                 env['PGPASSWORD'] = self.db_password
-            
+
             self.logger.info("Running PGSnapper package mode")
             package_cmd = [
                 'python3', pgsnapper_script,
@@ -1419,23 +1419,23 @@ fi
             ]
 
             result = subprocess.run(package_cmd, env=env, capture_output=True, text=True, timeout=600)  # nosec B603 - all args are static strings or validated identifiers  # nosemgrep: dangerous-subprocess-use-audit
-            
+
             # Log PGSnapper output for debugging
             if result.stdout:
                 self.logger.info(f"PGSnapper stdout: {result.stdout}")
             if result.stderr:
                 self.logger.warning(f"PGSnapper stderr: {result.stderr}")
-            
+
             if result.returncode != 0:
                 error_msg = f"PGSnapper package failed with return code {result.returncode}"
                 if result.stderr:
                     error_msg += f": {result.stderr}"
                 raise Exception(error_msg)
-            
+
             actual_output_dir = f'{output_dir}/{self.db_host}/{self.db_name}'
             analysis_db = self.load_pgsnapper_data(actual_output_dir)
             analysis_results = self.run_pgsnapper_analysis(analysis_db, min_days, skip_pg_stat_statements)
-            
+
             # Collection complete — remove the PGSnapper cron job to stop accumulating snapshots
             try:
                 result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)  # nosec B603 B607
@@ -1448,7 +1448,7 @@ fi
                     self.logger.info("PGSnapper cron job removed (collection complete)")
             except Exception as e:
                 self.logger.warning(f"Could not remove PGSnapper cron: {e}")
-            
+
             return {
                 'status': 'analyzed',
                 'pgsnapper_output_dir': actual_output_dir,
@@ -1456,7 +1456,7 @@ fi
                 'data_status': data_status,
                 **analysis_results
             }
-            
+
         except Exception as e:
             return {
                 'status': 'error',
@@ -1477,19 +1477,19 @@ fi
             pass
         return {'type': 'rds_instance', 'wal_framework': 'RDS_PostgreSQL_CustomLens_v1.json'}
 
-    def collect_all_data(self, cluster_id: str, pgsnapper_min_days: int = 3, 
-                     pgsnapper_interval_minutes: int = 60, status_file: Optional[str] = None, 
+    def collect_all_data(self, cluster_id: str, pgsnapper_min_days: int = 3,
+                     pgsnapper_interval_minutes: int = 60, status_file: Optional[str] = None,
                      skip_pg_stat_statements: bool = False,
                      setup_only: bool = False,
                      skip_non_invasive: bool = False) -> Dict[str, Any]:
         """Collect all invasive data for the cluster."""
         self.logger.info(f"Starting invasive data collection for cluster {cluster_id}")
-        
+
         # Detect database type dynamically
         db_type_info = self._detect_db_type(cluster_id)
         self._detected_db_type = db_type_info['type']
         self.logger.info(f"Detected {db_type_info['type']} for identifier: {cluster_id}")
-        
+
         # ── Run 1: Setup only — install pgsnapper cron, no data collection ──
         if setup_only:
             self.logger.info("Setup-only mode: installing PGSnapper cron job, no data collection")
@@ -1539,12 +1539,12 @@ fi
             except Exception as e:
                 self.logger.error(f"Error during PGSnapper setup: {e}")
                 raise
-        
+
         database_info = {
             'identifier': cluster_id,
             **db_type_info
         }
-        
+
         # ── Run 2 (or no-flag run): Collect data ──
         if skip_non_invasive:
             # Non-invasive already done by fleet — load it and merge
@@ -1562,14 +1562,14 @@ fi
         else:
             collected_data = super().collect_database_data(database_info)
             collected_data['collection_type'] = 'invasive'
-        
+
         try:
             # Add invasive data collection
             collected_data['database_statistics'] = self.collect_database_statistics()
             collected_data['configuration_parameters'] = self.collect_configuration_parameters()
             collected_data['schema_information'] = self.collect_schema_information()
             collected_data['query_performance'] = self.collect_query_performance()
-            
+
             # Collect comprehensive health insights (57 queries across 9 sections)
             try:
                 collected_data['pg_health_insights'] = self.collect_pg_health_insights(
@@ -1578,11 +1578,11 @@ fi
             except Exception as e:
                 self.logger.warning(f"pg_health_insights collection failed (non-fatal): {e}")
                 collected_data['pg_health_insights'] = {'error': str(e)}
-            
+
             # Collect PGSnapper data if requested
             if pgsnapper_min_days > 0:
                 collected_data['pgsnapper'] = self.collect_pgsnapper_data(pgsnapper_min_days, pgsnapper_interval_minutes, status_file, skip_pg_stat_statements)
-            
+
             # Apply PII redaction before writing to disk
             query_hash_map = {}
             if not getattr(self, '_skip_redaction', False):
@@ -1600,22 +1600,22 @@ fi
                     redactor = PiiRedactor()
                     collected_data, query_hash_map = redactor.redact(collected_data)
                 self.logger.info("PII redaction applied")
-            
+
             # Save to file
             output_file = os.path.join(self.output_dir, f"{cluster_id}_invasive_data.json")
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(collected_data, f, indent=2, default=str)
-            
+
             # Save query hash map (allows SA to look up original query text if needed)
             if query_hash_map:
                 hash_map_file = os.path.join(self.output_dir, f"{cluster_id}_query_hash_map.json")
                 with open(hash_map_file, 'w', encoding='utf-8') as f:
                     json.dump(query_hash_map, f, indent=2)
                 self.logger.info(f"Query hash map saved: {len(query_hash_map)} entries")
-            
+
             self.logger.info(f"Invasive data collection completed. Output saved to {output_file}")
             return collected_data
-            
+
         except Exception as e:
             self.logger.error(f"Error during invasive data collection: {e}")
             raise
@@ -1649,9 +1649,9 @@ def main():
     parser.add_argument('--no-redact', action='store_true',
                         help='Skip PII redaction (endpoints, client IPs, KMS ARNs). '
                              'Use only if you need the raw data for internal analysis.')
-    
+
     args = parser.parse_args()
-    
+
     # Get password from Secrets Manager if secret ARN provided and no password given
     if not args.db_password and args.db_secret_arn:
         try:
@@ -1687,7 +1687,7 @@ def main():
         else:
             print("❌ Error: Password could not be retrieved from Secrets Manager and no fallback is available.")
             return 1
-    
+
     try:
         collector = InvasiveCollector(
             region=args.region,
@@ -1701,7 +1701,7 @@ def main():
         )
         collector._skip_redaction = args.no_redact
         collector._skip_security = args.skip_security
-        
+
         result = collector.collect_all_data(
             args.cluster_id,
             pgsnapper_min_days=args.pgsnapper_min_days,
@@ -1711,7 +1711,7 @@ def main():
             setup_only=args.setup_only,
             skip_non_invasive=args.skip_non_invasive,
         )
-        
+
         # Check PGSnapper status and provide user guidance
         is_setup_only = result.get('collection_type') == 'invasive_setup_only'
         if 'pgsnapper' in result:
@@ -1762,14 +1762,14 @@ def main():
                 return 1
         else:
             print(f"✅ Invasive data collection completed successfully for cluster {args.cluster_id}")
-        
+
     except NoCredentialsError:
         print("❌ AWS credentials not found. Please configure AWS CLI or set environment variables.")
         return 1
     except Exception as e:
         print(f"❌ Error during data collection: {e}")
         return 1
-    
+
     return 0
 
 

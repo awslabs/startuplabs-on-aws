@@ -1,6 +1,6 @@
 -- Per-snapshot session activity summary (replaces raw session_activity_hist.sql)
 -- Aggregates session counts by wait event type per snapshot for trend visualization
-SELECT 
+SELECT
     a.snap_id,
     b.sample_start_time,
     COUNT(*) as total_sessions,

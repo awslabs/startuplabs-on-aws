@@ -15,7 +15,7 @@ with pg_stat_all_tables_vw as  (
  n_tup_hot_upd       ,
  n_live_tup          ,
  n_dead_tup          ,
- autovacuum_count    
+ autovacuum_count
  from pg_stat_all_tables_history a, pg_awr_snapshots_cust b where a.snap_id = b.snap_id
  and a.snap_id between :begin_snap_id and :end_snap_id
  and schemaname not in ('pg_catalog')),

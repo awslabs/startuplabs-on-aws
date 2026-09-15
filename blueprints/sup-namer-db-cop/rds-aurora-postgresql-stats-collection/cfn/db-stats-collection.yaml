@@ -7,7 +7,7 @@ Parameters:
     Default: t3.medium
     AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
     Description: EC2 instance type (t3.medium sufficient for data collection only)
-  
+
   KeyPairName:
     Type: String
     Default: ''
@@ -15,11 +15,11 @@ Parameters:
       EC2 Key Pair name for SSH access. Optional when using --no-public-ip
       (SSM Session Manager access only — no SSH needed).
       Required when AssignPublicIP is true.
-  
+
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC ID where the instance will be launched
-  
+
   SubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet ID where the instance will be launched (public subnet recommended)
@@ -30,7 +30,7 @@ Parameters:
     Description: PostgreSQL port on the target RDS/Aurora endpoint (used for invasive collection egress rule)
     AllowedValues: [5432, 5433, 5434, 5435, 5436, 5437, 5438, 5439, 5440]
     ConstraintDescription: Must be a valid PostgreSQL port (5432-5440)
-  
+
   AllowedCIDR:
     Type: String
     Default: '127.0.0.1/32'
@@ -39,7 +39,7 @@ Parameters:
       Not required when using --no-public-ip (defaults to 127.0.0.1/32 as a no-op placeholder).
     AllowedPattern: ^(?!0\.0\.0\.0/0$)([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$
     ConstraintDescription: Must be a valid IP CIDR range (x.x.x.x/x). 0.0.0.0/0 is not allowed for SSH access.
-  
+
   SADataBucket:
     Type: String
     Description: S3 bucket name for sharing data with SA (will be created if doesn't exist)
@@ -49,23 +49,23 @@ Parameters:
     Type: String
     Description: Resolved S3 bucket name (set by deploy script - either SADataBucket or auto-generated name)
     Default: ''
-  
+
   EnableScheduledCollection:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: Enable scheduled data collection
-  
+
   CollectionSchedule:
     Type: String
     Default: '0 6 * * *'
     Description: 'Cron schedule for data collection (default - daily at 6 AM)'
-  
+
   CodeSourceBucket:
     Type: String
     Description: S3 bucket containing application code (fallback if git clone fails)
     Default: ''
-  
+
   CodeSourceKey:
     Type: String
     Description: S3 key for application code zip file
@@ -567,7 +567,7 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-          
+
           # Update system and install packages
           # python3.11 is required by collect-and-share.sh and vendor wheels (psycopg2-binary cp311).
           # In air-gapped mode there is no internet — python3.11 RPMs are bundled in vendor/rpms/.
@@ -590,14 +590,14 @@ Resources:
             echo "[WARN] python3.11 not available, using $(python3 --version)"
           fi
           echo "Using Python: $PY ($($PY --version))"
-          
+
           # Create aliases for convenience (but don't override system python3)
           echo "alias python=\"$PY\"" >> /home/ec2-user/.bashrc
           echo "alias pip=\"$PY -m pip\"" >> /home/ec2-user/.bashrc
-          
+
           # Remove any existing virtual environments
           sudo -u ec2-user rm -rf /home/ec2-user/wal-db-stats-collection/venv
-          
+
           # Create application directory
           sudo -u ec2-user mkdir -p /home/ec2-user/wal-db-stats-collection
           cd /home/ec2-user/wal-db-stats-collection
@@ -702,7 +702,7 @@ Resources:
             fi
           fi
           # ─────────────────────────────────────────────────────────────────────
-          
+
           # Validate required files are present
           MISSING=""
           for f in scripts/non_invasive_collector.py scripts/invasive_collector.py utils/fleet_discovery.py utils/pii_redactor.py deployment/collect-and-share.sh requirements.txt; do
@@ -713,7 +713,7 @@ Resources:
             /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
             exit 1
           fi
-          
+
           # Install Python packages for python3.11 (application code)
           # Install Python packages (skipped in airgapped mode — handled by vendor/install.sh)
           if [ "${InstallMode}" != "airgapped" ]; then
@@ -724,33 +724,33 @@ Resources:
               exit 1
             }
           fi
-          
+
           # Setup local PostgreSQL for PGPerfStatsSnapper
           echo "[INFO] Setting up PostgreSQL..."
-          
+
           # Initialize PostgreSQL database
           postgresql-setup --initdb
-          
+
           # Configure PostgreSQL to use trust authentication for local connections
           sed -i 's/^local.*all.*all.*peer$/local   all             all                                     trust/' /var/lib/pgsql/data/pg_hba.conf
           sed -i 's/^host.*all.*all.*127.0.0.1\/32.*ident$/host    all             all             127.0.0.1\/32            trust/' /var/lib/pgsql/data/pg_hba.conf
-          
+
           # Start and enable PostgreSQL service
           systemctl start postgresql
           systemctl enable postgresql
-          
+
           # Start and enable cron service
           systemctl start crond
           systemctl enable crond
-          
+
           # Check PostgreSQL status
           systemctl status postgresql --no-pager
-          
+
           # Setup PGPerfStatsSnapper
           sudo -u ec2-user mkdir -p /home/ec2-user/pgperfstats
           cd /home/ec2-user/pgperfstats
           sudo -u ec2-user git clone https://github.com/aws-samples/aurora-and-database-migration-labs.git . || echo "Repository already exists"
-          
+
           # Install PGSnapper dependencies for python3.9 — skipped in air-gapped mode
           # (install.sh already installed boto3 and PyGreSQL from vendor bundle)
           if [ "${InstallMode}" != "airgapped" ]; then
@@ -778,24 +778,24 @@ Resources:
           mkdir -p /usr/local/pgsql/bin
           ln -sf /usr/bin/psql /usr/local/pgsql/bin/psql
           ln -sf /usr/bin/pg_dump /usr/local/pgsql/bin/pg_dump
-          
+
           # Fixed SQL queries are already in the repo at scripts/pgsnapper_sql_fixes/
           # No need to copy - the invasive_collector.py script will use them directly
-          
+
           # Fix permissions for PGSnapper directories (skip .rpm file if it fails)
           chmod -R 755 /home/ec2-user/pgperfstats/Code/ 2>/dev/null || true
           chmod -R 755 /home/ec2-user/pgperfstats/output/ 2>/dev/null || true
-          
+
           # Make SQL files readable by postgres user for analysis queries
           chmod -R a+rX /home/ec2-user/pgperfstats 2>/dev/null || true
-          
+
           # Allow postgres user to traverse /home/ec2-user to access SQL files
           chmod 755 /home/ec2-user
-          
+
           # Add PostgreSQL bin to PATH for PGSnapper
           echo 'export PATH=/usr/pgsql-15/bin:$PATH' >> /home/ec2-user/.bashrc
           echo 'export LD_LIBRARY_PATH=/usr/pgsql-15/lib' >> /home/ec2-user/.bashrc
-          
+
           # Set environment variables for data collection
           cat >> /home/ec2-user/.bashrc << 'EOF'
           export AWS_REGION=${AWS::Region}
@@ -803,11 +803,11 @@ Resources:
           export DATA_COLLECTION_MODE=true
           export AWS_KNOWLEDGE_MCP_REMOTE_URL="https://knowledge-mcp.global.api.aws"
           export PGPERFSTATS_DIR="/home/ec2-user/pgperfstats"
-          
+
           # Change to project directory on login
           cd /home/ec2-user/wal-db-stats-collection
           EOF
-          
+
           # Scripts are now packaged in the zip (deployment/collect-and-share.sh, deployment/enable-invasive-collection.sh)
           # Write config file with deployment-specific values (region, bucket)
           cat > /home/ec2-user/wal-db-stats-collection/deployment/collection.conf << 'CONF'
@@ -816,24 +816,24 @@ Resources:
           DATA_DIR=/home/ec2-user/wal-db-stats-collection/data
           CONF
           sed -i 's/^[[:space:]]*//' /home/ec2-user/wal-db-stats-collection/deployment/collection.conf
-          
+
           # Symlink scripts to project root for easy access
           ln -sf /home/ec2-user/wal-db-stats-collection/deployment/collect-and-share.sh                  /home/ec2-user/wal-db-stats-collection/collect-and-share.sh
           ln -sf /home/ec2-user/wal-db-stats-collection/deployment/enable-invasive-collection.sh                  /home/ec2-user/wal-db-stats-collection/enable-invasive-collection.sh
           chmod +x /home/ec2-user/wal-db-stats-collection/deployment/collect-and-share.sh
           chmod +x /home/ec2-user/wal-db-stats-collection/deployment/enable-invasive-collection.sh
-          
+
           # Set up scheduled data collection if enabled
           if [ "${EnableScheduledCollection}" = "true" ]; then
             sudo -u ec2-user crontab -l 2>/dev/null | { cat; echo "${CollectionSchedule} cd /home/ec2-user/wal-db-stats-collection && ./collect-and-share.sh >> /home/ec2-user/wal-db-stats-collection/logs/cron.log 2>&1"; } | sudo -u ec2-user crontab -
           fi
-          
+
           # Create systemd service for on-demand collection
           cat > /etc/systemd/system/db-stats-collection.service << 'EOF'
           [Unit]
           Description=Customer Data Collection Service
           After=network.target
-          
+
           [Service]
           Type=oneshot
           User=ec2-user
@@ -842,13 +842,13 @@ Resources:
           Environment=AWS_REGION=${AWS::Region}
           Environment=CUSTOMER_DATA_BUCKET=${ResolvedDataBucketName}
           ExecStart=/home/ec2-user/wal-db-stats-collection/collect-and-share.sh
-          
+
           [Install]
           WantedBy=multi-user.target
           EOF
-          
+
           systemctl enable db-stats-collection
-          
+
           # Install CloudWatch agent
           # In airgapped mode, download via S3 VPC endpoint; online mode uses public URL
           if [ "${InstallMode}" = "airgapped" ]; then
@@ -862,11 +862,11 @@ Resources:
             wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
             rpm -U ./amazon-cloudwatch-agent.rpm
           fi
-          
+
           # Remove wrapper scripts (no longer needed)
           # Set permissions
           chown -R ec2-user:ec2-user /home/ec2-user/wal-db-stats-collection
-          
+
           # Signal completion
           /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
       Tags:
@@ -1092,7 +1092,7 @@ Outputs:
     Value: !Ref CustomerDataCollectionSecurityGroup
     Export:
       Name: !Sub '${AWS::StackName}-InstanceSecurityGroup'
-  
+
   PublicIP:
     Description: Public IP address of the Customer Data Collection EC2 instance (empty when --no-public-ip)
     Value: !If
@@ -1101,19 +1101,19 @@ Outputs:
       - 'N/A - Private subnet deployment (use SSM)'
     Export:
       Name: !Sub '${AWS::StackName}-PublicIP'
-  
+
   PrivateIP:
     Description: Private IP address of the Customer Data Collection EC2 instance
     Value: !GetAtt CustomerDataCollectionInstance.PrivateIp
     Export:
       Name: !Sub '${AWS::StackName}-PrivateIP'
-  
+
   CustomerDataBucket:
     Description: S3 bucket for sharing data with SA
     Value: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
     Export:
       Name: !Sub '${AWS::StackName}-CustomerDataBucket'
-  
+
   SSHCommand:
     Description: Command to connect to the instance
     Value: !If
@@ -1123,23 +1123,23 @@ Outputs:
         - KP: !Ref KeyPairName
           IP: !GetAtt CustomerDataCollectionInstance.PublicIp
       - !Sub 'aws ssm start-session --target ${CustomerDataCollectionInstance} --region ${AWS::Region}'
-  
+
   DataCollectionCommand:
     Description: Command to run data collection and sharing
     Value: './collect-and-share.sh'
-  
+
   InvasiveCollectionCommand:
     Description: Command to enable invasive data collection with PGPerfStatsSnapper
     Value: './enable-invasive-collection.sh <cluster-id> <db-host> <db-user> <db-secret-arn> [db-name] [pgsnapper-min-days] [pgsnapper-interval] [skip-pg-stat-statements]'
-  
+
   ServiceCommand:
     Description: Command to run data collection as a service
     Value: 'sudo systemctl start db-stats-collection'
-  
+
   ScheduledCollection:
     Description: Scheduled data collection configuration
     Value: !Sub 'Enabled: ${EnableScheduledCollection}, Schedule: ${CollectionSchedule}'
-  
+
   SAInstructions:
     Description: S3 location of collected DB stats
     Value: !Sub 'Collected DB stats available at: s3://${ResolvedDataBucketName}/db-stats/'

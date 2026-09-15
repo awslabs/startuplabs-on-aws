@@ -1,7 +1,7 @@
 with get_func as (
 select sample_start_time,a.snap_id, schemaname AS schema_name, funcname AS func_name,round(calls) AS calls,
 round(total_time) AS total_time, round(self_time) AS self_time
-from pg_stat_user_functions_history a, pg_awr_snapshots_cust b 
+from pg_stat_user_functions_history a, pg_awr_snapshots_cust b
 where a.snap_id = b.snap_id
 and a.snap_id between :begin_snap_id and :end_snap_id
 order by schemaname,funcname,a.snap_id
