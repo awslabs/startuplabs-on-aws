@@ -336,7 +336,7 @@ Resources:
             Version: 2012-10-17
             Statement:
               - Action:
-                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:GetSecretValue'  # pragma: allowlist secret
                 Resource: !Ref PGSnapperSecret
                 Effect: Allow
           PolicyName: secret-access-policy

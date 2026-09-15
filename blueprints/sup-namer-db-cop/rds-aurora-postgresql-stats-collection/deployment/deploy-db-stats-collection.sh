@@ -281,7 +281,7 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
             [monitoring]="CreateMonitoringEndpoint"
             [pi]="CreatePIEndpoint"
             [cloudformation]="CreateCloudFormationEndpoint"
-            [secretsmanager]="CreateSecretsManagerEndpoint"
+            [secretsmanager]="CreateSecretsManagerEndpoint"  # pragma: allowlist secret
         )
 
         # Build per-endpoint parameter values

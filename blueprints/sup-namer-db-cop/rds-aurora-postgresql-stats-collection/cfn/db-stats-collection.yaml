@@ -437,8 +437,8 @@ Resources:
               # FIX-01: Secrets Manager — scoped to DBSecretArn when provided
               - Effect: Allow
                 Action:
-                  - secretsmanager:GetSecretValue
-                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue  # pragma: allowlist secret
+                  - secretsmanager:DescribeSecret  # pragma: allowlist secret
                 Resource: !If
                   - HasDBSecretArn
                   - !Ref DBSecretArn
