@@ -34,6 +34,9 @@ global_settings:
     - rule_id: 'yaml.github-actions.security.gha-curl-pipe-shell.gha-curl-pipe-shell'
       path: '.github/workflows/*'
       reason: 'Workflow files protected via CODEOWNERS and branch protection'
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'blueprints/sup-namer-db-cop/rds-aurora-postgresql-stats-collection/viewer/report-template.html'
+      reason: 'Prebuilt minified viewer bundle; keyword matches are identifiers, not values. Line 14 is the React bundle input-type map (password:!0); line 60 is the report app listing Postgres/RDS names (rds_password, password_encryption, password_security)'
 
 # Converters - transform files before scanning
 converters:
