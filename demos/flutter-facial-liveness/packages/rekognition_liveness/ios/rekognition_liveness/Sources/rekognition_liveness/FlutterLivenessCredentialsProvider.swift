@@ -9,26 +9,24 @@ struct FlutterLivenessCredentials: AWSTemporaryCredentials {
     let secretAccessKey: String
     let sessionToken: String
     let expiration: Date
-
-    init(accessKeyId: String, secretAccessKey: String, sessionToken: String) {
-        self.accessKeyId = accessKeyId
-        self.secretAccessKey = secretAccessKey
-        self.sessionToken = sessionToken
-        self.expiration = Date().addingTimeInterval(3600)
-    }
 }
 
+/// Hands the credentials fetched in Dart to the SDK. The SDK reads them once
+/// per session and never refreshes, so the expiration is the real one.
 struct FlutterLivenessCredentialsProvider: AWSCredentialsProvider {
-    let accessKeyId: String
-    let secretAccessKey: String
-    let sessionToken: String
+    let credentials: FlutterLivenessCredentials
+
+    init(message: LivenessCredentialsMessage) {
+        credentials = FlutterLivenessCredentials(
+            accessKeyId: message.accessKeyId,
+            secretAccessKey: message.secretAccessKey,
+            sessionToken: message.sessionToken,
+            expiration: Date(timeIntervalSince1970: TimeInterval(message.expirationEpochSeconds))
+        )
+    }
 
     func fetchAWSCredentials() async throws -> AWSCredentials {
-        FlutterLivenessCredentials(
-            accessKeyId: accessKeyId,
-            secretAccessKey: secretAccessKey,
-            sessionToken: sessionToken
-        )
+        credentials
     }
 }
 

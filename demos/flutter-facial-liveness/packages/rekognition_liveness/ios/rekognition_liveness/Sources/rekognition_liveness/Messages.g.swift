@@ -188,14 +188,36 @@ private func nilOrValue<T>(_ value: Any?) -> T? {
 }
 
 
+/// Stable error codes shared by iOS and Android, so Dart can decide between
+/// retry, step-up or a user message without comparing strings.
+enum LivenessErrorCode: Int, CaseIterable {
+  case unknown = 0
+  case sessionNotFound = 1
+  case accessDenied = 2
+  case cameraPermissionDenied = 3
+  case cameraNotAvailable = 4
+  case sessionInterrupted = 5
+  case sessionTimedOut = 6
+  case faceCheckFailed = 7
+  case unsupportedChallenge = 8
+  case userCancelled = 9
+  case videoEncoding = 10
+  case serviceError = 11
+  case sdkNotLinked = 12
+  case credentialsUnavailable = 13
+  case platformNotSupported = 14
+}
+
 /// Temporary AWS credentials handed to the native liveness SDK, which signs the
-/// WebSocket to Amazon Rekognition directly.
+/// WebSocket to Amazon Rekognition directly. The SDK fetches them once per
+/// session and never refreshes, so the real expiration must travel with them.
 ///
 /// Generated class from Pigeon that represents data sent in messages.
 struct LivenessCredentialsMessage: Hashable, CustomStringConvertible {
   var accessKeyId: String
   var secretAccessKey: String
   var sessionToken: String
+  var expirationEpochSeconds: Int64
 
 
   // swift-format-ignore: AlwaysUseLowerCamelCase
@@ -203,11 +225,13 @@ struct LivenessCredentialsMessage: Hashable, CustomStringConvertible {
     let accessKeyId = pigeonVar_list[0] as! String
     let secretAccessKey = pigeonVar_list[1] as! String
     let sessionToken = pigeonVar_list[2] as! String
+    let expirationEpochSeconds = pigeonVar_list[3] as! Int64
 
     return LivenessCredentialsMessage(
       accessKeyId: accessKeyId,
       secretAccessKey: secretAccessKey,
-      sessionToken: sessionToken
+      sessionToken: sessionToken,
+      expirationEpochSeconds: expirationEpochSeconds
     )
   }
   func toList() -> [Any?] {
@@ -215,13 +239,14 @@ struct LivenessCredentialsMessage: Hashable, CustomStringConvertible {
       accessKeyId,
       secretAccessKey,
       sessionToken,
+      expirationEpochSeconds,
     ]
   }
   static func == (lhs: LivenessCredentialsMessage, rhs: LivenessCredentialsMessage) -> Bool {
     if Swift.type(of: lhs) != Swift.type(of: rhs) {
       return false
     }
-    return MessagesPigeonInternal.deepEquals(lhs.accessKeyId, rhs.accessKeyId) && MessagesPigeonInternal.deepEquals(lhs.secretAccessKey, rhs.secretAccessKey) && MessagesPigeonInternal.deepEquals(lhs.sessionToken, rhs.sessionToken)
+    return MessagesPigeonInternal.deepEquals(lhs.accessKeyId, rhs.accessKeyId) && MessagesPigeonInternal.deepEquals(lhs.secretAccessKey, rhs.secretAccessKey) && MessagesPigeonInternal.deepEquals(lhs.sessionToken, rhs.sessionToken) && MessagesPigeonInternal.deepEquals(lhs.expirationEpochSeconds, rhs.expirationEpochSeconds)
   }
 
   func hash(into hasher: inout Hasher) {
@@ -229,62 +254,49 @@ struct LivenessCredentialsMessage: Hashable, CustomStringConvertible {
     MessagesPigeonInternal.deepHash(value: accessKeyId, hasher: &hasher)
     MessagesPigeonInternal.deepHash(value: secretAccessKey, hasher: &hasher)
     MessagesPigeonInternal.deepHash(value: sessionToken, hasher: &hasher)
+    MessagesPigeonInternal.deepHash(value: expirationEpochSeconds, hasher: &hasher)
   }
 
   public var description: String {
-    return "LivenessCredentialsMessage(accessKeyId: \(String(describing: accessKeyId)), secretAccessKey: \(String(describing: secretAccessKey)), sessionToken: \(String(describing: sessionToken)))"
+    return "LivenessCredentialsMessage(accessKeyId: \(String(describing: accessKeyId)), secretAccessKey: \(String(describing: secretAccessKey)), sessionToken: \(String(describing: sessionToken)), expirationEpochSeconds: \(String(describing: expirationEpochSeconds)))"
   }
 }
 
-/// Result of a completed liveness check, surfaced by the native SDK.
+/// The native SDK finished streaming. It carries no verdict on either
+/// platform: the backend reads the result with GetFaceLivenessSessionResults.
 ///
 /// Generated class from Pigeon that represents data sent in messages.
-struct LivenessResultMessage: Hashable, CustomStringConvertible {
+struct LivenessCompletionMessage: Hashable, CustomStringConvertible {
   var sessionId: String
-  var isLive: Bool
-  var confidence: Double
-  var referenceImage: FlutterStandardTypedData? = nil
 
 
   // swift-format-ignore: AlwaysUseLowerCamelCase
-  static func fromList(_ pigeonVar_list: [Any?]) -> LivenessResultMessage? {
+  static func fromList(_ pigeonVar_list: [Any?]) -> LivenessCompletionMessage? {
     let sessionId = pigeonVar_list[0] as! String
-    let isLive = pigeonVar_list[1] as! Bool
-    let confidence = pigeonVar_list[2] as! Double
-    let referenceImage: FlutterStandardTypedData? = nilOrValue(pigeonVar_list[3])
 
-    return LivenessResultMessage(
-      sessionId: sessionId,
-      isLive: isLive,
-      confidence: confidence,
-      referenceImage: referenceImage
+    return LivenessCompletionMessage(
+      sessionId: sessionId
     )
   }
   func toList() -> [Any?] {
     return [
-      sessionId,
-      isLive,
-      confidence,
-      referenceImage,
+      sessionId
     ]
   }
-  static func == (lhs: LivenessResultMessage, rhs: LivenessResultMessage) -> Bool {
+  static func == (lhs: LivenessCompletionMessage, rhs: LivenessCompletionMessage) -> Bool {
     if Swift.type(of: lhs) != Swift.type(of: rhs) {
       return false
     }
-    return MessagesPigeonInternal.deepEquals(lhs.sessionId, rhs.sessionId) && MessagesPigeonInternal.deepEquals(lhs.isLive, rhs.isLive) && MessagesPigeonInternal.deepEquals(lhs.confidence, rhs.confidence) && MessagesPigeonInternal.deepEquals(lhs.referenceImage, rhs.referenceImage)
+    return MessagesPigeonInternal.deepEquals(lhs.sessionId, rhs.sessionId)
   }
 
   func hash(into hasher: inout Hasher) {
-    hasher.combine("LivenessResultMessage")
+    hasher.combine("LivenessCompletionMessage")
     MessagesPigeonInternal.deepHash(value: sessionId, hasher: &hasher)
-    MessagesPigeonInternal.deepHash(value: isLive, hasher: &hasher)
-    MessagesPigeonInternal.deepHash(value: confidence, hasher: &hasher)
-    MessagesPigeonInternal.deepHash(value: referenceImage, hasher: &hasher)
   }
 
   public var description: String {
-    return "LivenessResultMessage(sessionId: \(String(describing: sessionId)), isLive: \(String(describing: isLive)), confidence: \(String(describing: confidence)), referenceImage: \(String(describing: referenceImage)))"
+    return "LivenessCompletionMessage(sessionId: \(String(describing: sessionId)))"
   }
 }
 
@@ -292,13 +304,13 @@ struct LivenessResultMessage: Hashable, CustomStringConvertible {
 ///
 /// Generated class from Pigeon that represents data sent in messages.
 struct LivenessErrorMessage: Hashable, CustomStringConvertible {
-  var code: String
+  var code: LivenessErrorCode
   var message: String
 
 
   // swift-format-ignore: AlwaysUseLowerCamelCase
   static func fromList(_ pigeonVar_list: [Any?]) -> LivenessErrorMessage? {
-    let code = pigeonVar_list[0] as! String
+    let code = pigeonVar_list[0] as! LivenessErrorCode
     let message = pigeonVar_list[1] as! String
 
     return LivenessErrorMessage(
@@ -334,10 +346,16 @@ private class MessagesPigeonCodecReader: FlutterStandardReader {
   override func readValue(ofType type: UInt8) -> Any? {
     switch type {
     case 129:
-      return LivenessCredentialsMessage.fromList(self.readValue() as! [Any?])
+      let enumResultAsInt: Int? = nilOrValue(self.readValue() as! Int?)
+      if let enumResultAsInt = enumResultAsInt {
+        return LivenessErrorCode(rawValue: enumResultAsInt)
+      }
+      return nil
     case 130:
-      return LivenessResultMessage.fromList(self.readValue() as! [Any?])
+      return LivenessCredentialsMessage.fromList(self.readValue() as! [Any?])
     case 131:
+      return LivenessCompletionMessage.fromList(self.readValue() as! [Any?])
+    case 132:
       return LivenessErrorMessage.fromList(self.readValue() as! [Any?])
     default:
       return super.readValue(ofType: type)
@@ -347,14 +365,17 @@ private class MessagesPigeonCodecReader: FlutterStandardReader {
 
 private class MessagesPigeonCodecWriter: FlutterStandardWriter {
   override func writeValue(_ value: Any) {
-    if let value = value as? LivenessCredentialsMessage {
+    if let value = value as? LivenessErrorCode {
       super.writeByte(129)
-      super.writeValue(value.toList())
-    } else if let value = value as? LivenessResultMessage {
+      super.writeValue(value.rawValue)
+    } else if let value = value as? LivenessCredentialsMessage {
       super.writeByte(130)
       super.writeValue(value.toList())
-    } else if let value = value as? LivenessErrorMessage {
+    } else if let value = value as? LivenessCompletionMessage {
       super.writeByte(131)
+      super.writeValue(value.toList())
+    } else if let value = value as? LivenessErrorMessage {
+      super.writeByte(132)
       super.writeValue(value.toList())
     } else {
       super.writeValue(value)
@@ -376,9 +397,10 @@ class MessagesPigeonCodec: FlutterStandardMessageCodec, @unchecked Sendable {
   static let shared = MessagesPigeonCodec(readerWriter: MessagesPigeonCodecReaderWriter())
 }
 
-/// Dart -> native. Called once, after the platform view is created and Cognito
+
+/// Dart -> native. Called once, after the platform view is created and
 /// credentials have been fetched. Receiving credentials is the signal for the
-/// native side to present the FaceLivenessDetectorView.
+/// native side to present the liveness detector.
 ///
 /// Generated protocol from Pigeon that represents a handler of messages from Flutter.
 protocol LivenessHostApi {
@@ -408,12 +430,43 @@ class LivenessHostApiSetup {
     }
   }
 }
+/// Dart -> native, app-wide (no channel suffix). The Android SDK does not ask
+/// for the camera permission itself, so the app asks before showing the view.
+///
+/// Generated protocol from Pigeon that represents a handler of messages from Flutter.
+protocol LivenessPermissionApi {
+  func requestCameraPermission(completion: @escaping (Result<Bool, Error>) -> Void)
+}
+
+/// Generated setup class from Pigeon to handle messages through the `binaryMessenger`.
+class LivenessPermissionApiSetup {
+  static var codec: FlutterStandardMessageCodec { MessagesPigeonCodec.shared }
+  /// Sets up an instance of `LivenessPermissionApi` to handle messages through the `binaryMessenger`.
+  static func setUp(binaryMessenger: FlutterBinaryMessenger, api: LivenessPermissionApi?, messageChannelSuffix: String = "") {
+    let channelSuffix = messageChannelSuffix.count > 0 ? ".\(messageChannelSuffix)" : ""
+    let requestCameraPermissionChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.rekognition_liveness.LivenessPermissionApi.requestCameraPermission\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
+    if let api = api {
+      requestCameraPermissionChannel.setMessageHandler { _, reply in
+        api.requestCameraPermission { result in
+          switch result {
+          case .success(let res):
+            reply(wrapResult(res))
+          case .failure(let error):
+            reply(wrapError(error))
+          }
+        }
+      }
+    } else {
+      requestCameraPermissionChannel.setMessageHandler(nil)
+    }
+  }
+}
 
 /// Native -> Dart. Terminal callbacks; exactly one fires per session.
 ///
 /// Generated protocol from Pigeon that represents Flutter messages that can be called from Swift.
 protocol LivenessFlutterApiProtocol {
-  func onComplete(result resultArg: LivenessResultMessage, completion: @escaping (Result<Void, PigeonError>) -> Void)
+  func onComplete(completion completionArg: LivenessCompletionMessage, completion: @escaping (Result<Void, PigeonError>) -> Void)
   func onError(error errorArg: LivenessErrorMessage, completion: @escaping (Result<Void, PigeonError>) -> Void)
 }
 class LivenessFlutterApi: LivenessFlutterApiProtocol {
@@ -426,10 +479,10 @@ class LivenessFlutterApi: LivenessFlutterApiProtocol {
   var codec: MessagesPigeonCodec {
     return MessagesPigeonCodec.shared
   }
-  func onComplete(result resultArg: LivenessResultMessage, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+  func onComplete(completion completionArg: LivenessCompletionMessage, completion: @escaping (Result<Void, PigeonError>) -> Void) {
     let channelName: String = "dev.flutter.pigeon.rekognition_liveness.LivenessFlutterApi.onComplete\(messageChannelSuffix)"
     let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
-    channel.sendMessage([resultArg] as [Any?]) { response in
+    channel.sendMessage([completionArg] as [Any?]) { response in
       guard let listResponse = response as? [Any?] else {
         completion(.failure(createConnectionError(withChannelName: channelName)))
         return

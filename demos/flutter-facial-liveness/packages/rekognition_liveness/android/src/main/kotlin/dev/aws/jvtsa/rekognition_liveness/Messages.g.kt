@@ -196,15 +196,45 @@ class FlutterError (
 ) : RuntimeException()
 
 /**
+ * Stable error codes shared by iOS and Android, so Dart can decide between
+ * retry, step-up or a user message without comparing strings.
+ */
+enum class LivenessErrorCode(val raw: Int) {
+  UNKNOWN(0),
+  SESSION_NOT_FOUND(1),
+  ACCESS_DENIED(2),
+  CAMERA_PERMISSION_DENIED(3),
+  CAMERA_NOT_AVAILABLE(4),
+  SESSION_INTERRUPTED(5),
+  SESSION_TIMED_OUT(6),
+  FACE_CHECK_FAILED(7),
+  UNSUPPORTED_CHALLENGE(8),
+  USER_CANCELLED(9),
+  VIDEO_ENCODING(10),
+  SERVICE_ERROR(11),
+  SDK_NOT_LINKED(12),
+  CREDENTIALS_UNAVAILABLE(13),
+  PLATFORM_NOT_SUPPORTED(14);
+
+  companion object {
+    fun ofRaw(raw: Int): LivenessErrorCode? {
+      return values().firstOrNull { it.raw == raw }
+    }
+  }
+}
+
+/**
  * Temporary AWS credentials handed to the native liveness SDK, which signs the
- * WebSocket to Amazon Rekognition directly.
+ * WebSocket to Amazon Rekognition directly. The SDK fetches them once per
+ * session and never refreshes, so the real expiration must travel with them.
  *
  * Generated class from Pigeon that represents data sent in messages.
  */
 data class LivenessCredentialsMessage (
   val accessKeyId: String,
   val secretAccessKey: String,
-  val sessionToken: String
+  val sessionToken: String,
+  val expirationEpochSeconds: Long
 )
  {
   companion object {
@@ -212,7 +242,8 @@ data class LivenessCredentialsMessage (
       val accessKeyId = pigeonVar_list[0] as String
       val secretAccessKey = pigeonVar_list[1] as String
       val sessionToken = pigeonVar_list[2] as String
-      return LivenessCredentialsMessage(accessKeyId, secretAccessKey, sessionToken)
+      val expirationEpochSeconds = pigeonVar_list[3] as Long
+      return LivenessCredentialsMessage(accessKeyId, secretAccessKey, sessionToken, expirationEpochSeconds)
     }
   }
   fun toList(): List<Any?> {
@@ -220,6 +251,7 @@ data class LivenessCredentialsMessage (
       accessKeyId,
       secretAccessKey,
       sessionToken,
+      expirationEpochSeconds,
     )
   }
   override fun equals(other: Any?): Boolean {
@@ -230,7 +262,7 @@ data class LivenessCredentialsMessage (
       return true
     }
     val other = other as LivenessCredentialsMessage
-    return MessagesPigeonUtils.deepEquals(this.accessKeyId, other.accessKeyId) && MessagesPigeonUtils.deepEquals(this.secretAccessKey, other.secretAccessKey) && MessagesPigeonUtils.deepEquals(this.sessionToken, other.sessionToken)
+    return MessagesPigeonUtils.deepEquals(this.accessKeyId, other.accessKeyId) && MessagesPigeonUtils.deepEquals(this.secretAccessKey, other.secretAccessKey) && MessagesPigeonUtils.deepEquals(this.sessionToken, other.sessionToken) && MessagesPigeonUtils.deepEquals(this.expirationEpochSeconds, other.expirationEpochSeconds)
   }
 
   override fun hashCode(): Int {
@@ -238,40 +270,33 @@ data class LivenessCredentialsMessage (
     result = 31 * result + MessagesPigeonUtils.deepHash(this.accessKeyId)
     result = 31 * result + MessagesPigeonUtils.deepHash(this.secretAccessKey)
     result = 31 * result + MessagesPigeonUtils.deepHash(this.sessionToken)
+    result = 31 * result + MessagesPigeonUtils.deepHash(this.expirationEpochSeconds)
     return result
   }
   override fun toString(): String {
-    return "LivenessCredentialsMessage(accessKeyId=$accessKeyId, secretAccessKey=$secretAccessKey, sessionToken=$sessionToken)"
+    return "LivenessCredentialsMessage(accessKeyId=$accessKeyId, secretAccessKey=$secretAccessKey, sessionToken=$sessionToken, expirationEpochSeconds=$expirationEpochSeconds)"
   }
 }
 
 /**
- * Result of a completed liveness check, surfaced by the native SDK.
+ * The native SDK finished streaming. It carries no verdict on either
+ * platform: the backend reads the result with GetFaceLivenessSessionResults.
  *
  * Generated class from Pigeon that represents data sent in messages.
  */
-data class LivenessResultMessage (
-  val sessionId: String,
-  val isLive: Boolean,
-  val confidence: Double,
-  val referenceImage: ByteArray? = null
+data class LivenessCompletionMessage (
+  val sessionId: String
 )
  {
   companion object {
-    fun fromList(pigeonVar_list: List<Any?>): LivenessResultMessage {
+    fun fromList(pigeonVar_list: List<Any?>): LivenessCompletionMessage {
       val sessionId = pigeonVar_list[0] as String
-      val isLive = pigeonVar_list[1] as Boolean
-      val confidence = pigeonVar_list[2] as Double
-      val referenceImage = pigeonVar_list[3] as ByteArray?
-      return LivenessResultMessage(sessionId, isLive, confidence, referenceImage)
+      return LivenessCompletionMessage(sessionId)
     }
   }
   fun toList(): List<Any?> {
     return listOf(
       sessionId,
-      isLive,
-      confidence,
-      referenceImage,
     )
   }
   override fun equals(other: Any?): Boolean {
@@ -281,20 +306,17 @@ data class LivenessResultMessage (
     if (this === other) {
       return true
     }
-    val other = other as LivenessResultMessage
-    return MessagesPigeonUtils.deepEquals(this.sessionId, other.sessionId) && MessagesPigeonUtils.deepEquals(this.isLive, other.isLive) && MessagesPigeonUtils.deepEquals(this.confidence, other.confidence) && MessagesPigeonUtils.deepEquals(this.referenceImage, other.referenceImage)
+    val other = other as LivenessCompletionMessage
+    return MessagesPigeonUtils.deepEquals(this.sessionId, other.sessionId)
   }
 
   override fun hashCode(): Int {
     var result = javaClass.hashCode()
     result = 31 * result + MessagesPigeonUtils.deepHash(this.sessionId)
-    result = 31 * result + MessagesPigeonUtils.deepHash(this.isLive)
-    result = 31 * result + MessagesPigeonUtils.deepHash(this.confidence)
-    result = 31 * result + MessagesPigeonUtils.deepHash(this.referenceImage)
     return result
   }
   override fun toString(): String {
-    return "LivenessResultMessage(sessionId=$sessionId, isLive=$isLive, confidence=$confidence, referenceImage=${referenceImage?.contentToString()})"
+    return "LivenessCompletionMessage(sessionId=$sessionId)"
   }
 }
 
@@ -304,13 +326,13 @@ data class LivenessResultMessage (
  * Generated class from Pigeon that represents data sent in messages.
  */
 data class LivenessErrorMessage (
-  val code: String,
+  val code: LivenessErrorCode,
   val message: String
 )
  {
   companion object {
     fun fromList(pigeonVar_list: List<Any?>): LivenessErrorMessage {
-      val code = pigeonVar_list[0] as String
+      val code = pigeonVar_list[0] as LivenessErrorCode
       val message = pigeonVar_list[1] as String
       return LivenessErrorMessage(code, message)
     }
@@ -346,16 +368,21 @@ private open class MessagesPigeonCodec : StandardMessageCodec() {
   override fun readValueOfType(type: Byte, buffer: ByteBuffer): Any? {
     return when (type) {
       129.toByte() -> {
-        return (readValue(buffer) as? List<Any?>)?.let {
-          LivenessCredentialsMessage.fromList(it)
+        return (readValue(buffer) as Long?)?.let {
+          LivenessErrorCode.ofRaw(it.toInt())
         }
       }
       130.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          LivenessResultMessage.fromList(it)
+          LivenessCredentialsMessage.fromList(it)
         }
       }
       131.toByte() -> {
+        return (readValue(buffer) as? List<Any?>)?.let {
+          LivenessCompletionMessage.fromList(it)
+        }
+      }
+      132.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
           LivenessErrorMessage.fromList(it)
         }
@@ -365,16 +392,20 @@ private open class MessagesPigeonCodec : StandardMessageCodec() {
   }
   override fun writeValue(stream: ByteArrayOutputStream, value: Any?)   {
     when (value) {
-      is LivenessCredentialsMessage -> {
+      is LivenessErrorCode -> {
         stream.write(129)
-        writeValue(stream, value.toList())
+        writeValue(stream, value.raw.toLong())
       }
-      is LivenessResultMessage -> {
+      is LivenessCredentialsMessage -> {
         stream.write(130)
         writeValue(stream, value.toList())
       }
-      is LivenessErrorMessage -> {
+      is LivenessCompletionMessage -> {
         stream.write(131)
+        writeValue(stream, value.toList())
+      }
+      is LivenessErrorMessage -> {
+        stream.write(132)
         writeValue(stream, value.toList())
       }
       else -> super.writeValue(stream, value)
@@ -382,10 +413,11 @@ private open class MessagesPigeonCodec : StandardMessageCodec() {
   }
 }
 
+
 /**
- * Dart -> native. Called once, after the platform view is created and Cognito
+ * Dart -> native. Called once, after the platform view is created and
  * credentials have been fetched. Receiving credentials is the signal for the
- * native side to present the FaceLivenessDetectorView.
+ * native side to present the liveness detector.
  *
  * Generated interface from Pigeon that represents a handler of messages from Flutter.
  */
@@ -423,6 +455,45 @@ interface LivenessHostApi {
   }
 }
 /**
+ * Dart -> native, app-wide (no channel suffix). The Android SDK does not ask
+ * for the camera permission itself, so the app asks before showing the view.
+ *
+ * Generated interface from Pigeon that represents a handler of messages from Flutter.
+ */
+interface LivenessPermissionApi {
+  fun requestCameraPermission(callback: (Result<Boolean>) -> Unit)
+
+  companion object {
+    /** The codec used by LivenessPermissionApi. */
+    val codec: MessageCodec<Any?> by lazy {
+      MessagesPigeonCodec()
+    }
+    /** Sets up an instance of `LivenessPermissionApi` to handle messages through the `binaryMessenger`. */
+    @JvmOverloads
+    fun setUp(binaryMessenger: BinaryMessenger, api: LivenessPermissionApi?, messageChannelSuffix: String = "") {
+      val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.rekognition_liveness.LivenessPermissionApi.requestCameraPermission$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { _, reply ->
+            api.requestCameraPermission{ result: Result<Boolean> ->
+              val error = result.exceptionOrNull()
+              if (error != null) {
+                reply.reply(MessagesPigeonUtils.wrapError(error))
+              } else {
+                val data = result.getOrNull()
+                reply.reply(MessagesPigeonUtils.wrapResult(data))
+              }
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+    }
+  }
+}
+/**
  * Native -> Dart. Terminal callbacks; exactly one fires per session.
  *
  * Generated class from Pigeon that represents Flutter messages that can be called from Kotlin.
@@ -434,12 +505,12 @@ class LivenessFlutterApi(private val binaryMessenger: BinaryMessenger, private v
       MessagesPigeonCodec()
     }
   }
-  fun onComplete(resultArg: LivenessResultMessage, callback: (Result<Unit>) -> Unit)
+  fun onComplete(completionArg: LivenessCompletionMessage, callback: (Result<Unit>) -> Unit)
 {
     val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
     val channelName = "dev.flutter.pigeon.rekognition_liveness.LivenessFlutterApi.onComplete$separatedMessageChannelSuffix"
     val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
-    channel.send(listOf(resultArg)) {
+    channel.send(listOf(completionArg)) {
       if (it is List<*>) {
         if (it.size > 1) {
           callback(Result.failure(FlutterError(it[0] as String, it[1] as String, it[2] as String?)))

@@ -1,17 +1,19 @@
 name: rekognition_liveness
 description: Flutter plugin wrapping AWS Amplify FaceLivenessDetector (iOS/Android) via Platform Views.
-version: 0.2.0
+version: 0.3.0
 homepage:
 publish_to: none
 
 environment:
   sdk: ^3.12.2
-  flutter: '>=3.22.0'
+  flutter: '>=3.38.0'
 
 dependencies:
   flutter:
     sdk: flutter
   plugin_platform_interface: ^2.0.2
+  # FlutterLifecycleAdapter: host Activity/Fragment lifecycle for the Android views.
+  flutter_plugin_android_lifecycle: ^2.0.35
 
 dev_dependencies:
   flutter_test:

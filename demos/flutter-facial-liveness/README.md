@@ -1,6 +1,6 @@
 # Flutter Facial Liveness on AWS
 
-A Flutter (iOS) demo that proves a **live person** is present using
+A Flutter (iOS and Android) demo that proves a **live person** is present using
 [Amazon Rekognition Face Liveness](https://docs.aws.amazon.com/rekognition/latest/dg/face-liveness.html),
 plus image analysis (face/label detection) — all without ever placing AWS
 credentials in the mobile app.
@@ -9,7 +9,8 @@ It shows two patterns SAs are frequently asked about:
 
 1. **How to structure a Flutter app + AWS wrapper** so it is testable and never
    leaks AWS credentials.
-2. **How to embed a native AWS SDK view** (Amplify's `FaceLivenessDetectorView`)
+2. **How to embed a native AWS SDK view** (Amplify's SwiftUI
+   `FaceLivenessDetectorView` on iOS, Compose `FaceLivenessDetector` on Android)
    inside Flutter through a type-safe Platform View bridge.
 
 > This is sample code for demonstration and learning. It is **not
@@ -18,18 +19,18 @@ It shows two patterns SAs are frequently asked about:
 
 ## Architecture
 
-Region: `us-east-1`. Two independent paths from the iOS app — a proxied image
+Region: `us-east-1`. Two independent paths from the app — a proxied image
 analysis path and a native Face Liveness path.
 
 ```mermaid
 flowchart TB
     user([User])
 
-    subgraph client["Flutter app (iOS)"]
+    subgraph client["Flutter app (iOS / Android)"]
         dart["Dart<br/>LivenessDetectorWidget"]
         pigeon["Pigeon<br/>type-safe channel"]
-        swift["Swift<br/>FaceLivenessPlatformView"]
-        amplify["Amplify SDK<br/>FaceLivenessDetectorView"]
+        swift["Swift / Kotlin<br/>FaceLivenessPlatformView"]
+        amplify["Amplify UI Liveness<br/>SwiftUI / Compose detector"]
         client_wrap["rekognition_client<br/>(pure-Dart proxy wrapper)"]
     end
 
@@ -44,7 +45,7 @@ flowchart TB
     user -->|"1 - use the app"| dart
     dart -->|"2 - setCredentials"| pigeon
     pigeon -->|"3 - bridge"| swift
-    swift -->|"4 - hosts SwiftUI view"| amplify
+    swift -->|"4 - hosts native view"| amplify
     dart -->|"5 - fetch guest creds"| cognito
     amplify -->|"6 - stream video (signed WebSocket)"| rekognition
     dart -.->|"onComplete / onError"| dart
@@ -60,12 +61,12 @@ flowchart TB
 <summary>Text version</summary>
 
 ```
-Flutter app (iOS)
+Flutter app (iOS / Android)
   ├── rekognition_client (pure-Dart wrapper)  ──► API Gateway + Lambda (proxy)  ──► Amazon Rekognition
   │                                                (least-privilege IAM role)        DetectFaces / DetectLabels
   │
   └── rekognition_liveness (native plugin)    ──► Cognito Identity (guest creds, scoped)
-        Amplify FaceLivenessDetectorView       ──► streams video over signed WebSocket ──► Amazon Rekognition
+        Amplify UI Liveness (SwiftUI/Compose)  ──► streams video over signed WebSocket ──► Amazon Rekognition
                                                                                             Face Liveness
 ```
 
@@ -96,7 +97,7 @@ Two independent paths:
 |------|------------|
 | [`backend/cdk/`](backend/cdk/) | API Gateway + Lambda + least-privilege IAM (AWS CDK) |
 | [`packages/rekognition_client/`](packages/rekognition_client/) | Pure-Dart wrapper: interface, HTTP impl, models, tests |
-| [`packages/rekognition_liveness/`](packages/rekognition_liveness/) | Flutter plugin embedding the native Amplify liveness view (iOS) |
+| [`packages/rekognition_liveness/`](packages/rekognition_liveness/) | Flutter plugin embedding the native Amplify liveness view (iOS and Android) |
 | [`app_example/`](app_example/) | Flutter app (feature-first + Riverpod) that consumes both |
 
 ## How to run
@@ -123,6 +124,12 @@ Two independent paths:
      --dart-define=AWS_REGION=us-east-1
    ```
 
+   On Android, `app_example/android` already carries the two settings any host
+   app needs for the liveness plugin (core library desugaring and
+   `android.uniquePackageNames=false`). See the
+   [plugin README](packages/rekognition_liveness/README.md#android) if you embed
+   the plugin in another app.
+
 ## Security
 
 - The app **never** carries AWS credentials. Only the Lambda talks to
@@ -141,8 +148,21 @@ for each service used. Prices are subject to change.
 
 ## Platform support
 
-iOS only for the native Face Liveness flow. Android is documented in the plugin
-but not yet wired up. Image analysis (via the proxy) is platform-agnostic.
+| Platform | Native liveness component | Validation |
+|----------|---------------------------|------------|
+| iOS 14+ | `amplify-ui-swift-liveness` 1.4.2 | Full challenge on a physical iPhone with plugin 0.2.0; the 0.3.0 changes compile for the simulator but were not re-run on a device |
+| Android API 24+ (Android 7.0) | `com.amplifyframework.ui:liveness` 1.11.0 | Emulators only, Android 7.0 (API 24) and Android 16 (API 36), see below |
+
+Android was validated on emulators at both ends of the supported range, Android
+7.0 (API 24) and Android 16 (API 36): the detector opens inside the platform
+view, the runtime camera permission prompt works (deny and allow), CameraX binds
+to the view lifecycle, the camera is released when the app goes to the
+background and when the view is disposed, and typed errors reach Dart (for
+example `userCancelled`). The emulated camera produces no face, so the
+full challenge and the signed WebSocket stream to Rekognition have **not** been
+exercised on Android yet. Run it on a physical device before relying on it.
+
+Image analysis (via the proxy) is platform-agnostic.
 
 ## License
 
