@@ -1,0 +1,1145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Customer data collection deployment for GenAI WAL Review - fleet discovery and data collection only'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: EC2 instance type (t3.medium sufficient for data collection only)
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: >
+      EC2 Key Pair name for SSH access. Optional when using --no-public-ip
+      (SSM Session Manager access only — no SSH needed).
+      Required when AssignPublicIP is true.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the instance will be launched
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID where the instance will be launched (public subnet recommended)
+
+  DBPort:
+    Type: Number
+    Default: 5432
+    Description: PostgreSQL port on the target RDS/Aurora endpoint (used for invasive collection egress rule)
+    AllowedValues: [5432, 5433, 5434, 5435, 5436, 5437, 5438, 5439, 5440]
+    ConstraintDescription: Must be a valid PostgreSQL port (5432-5440)
+
+  AllowedCIDR:
+    Type: String
+    Default: '127.0.0.1/32'
+    Description: >
+      CIDR block allowed for SSH access (0.0.0.0/0 not permitted).
+      Not required when using --no-public-ip (defaults to 127.0.0.1/32 as a no-op placeholder).
+    AllowedPattern: ^(?!0\.0\.0\.0/0$)([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$
+    ConstraintDescription: Must be a valid IP CIDR range (x.x.x.x/x). 0.0.0.0/0 is not allowed for SSH access.
+
+  SADataBucket:
+    Type: String
+    Description: S3 bucket name for sharing data with SA (will be created if doesn't exist)
+    Default: ''
+
+  ResolvedDataBucketName:
+    Type: String
+    Description: Resolved S3 bucket name (set by deploy script - either SADataBucket or auto-generated name)
+    Default: ''
+
+  EnableScheduledCollection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable scheduled data collection
+
+  CollectionSchedule:
+    Type: String
+    Default: '0 6 * * *'
+    Description: 'Cron schedule for data collection (default - daily at 6 AM)'
+
+  CodeSourceBucket:
+    Type: String
+    Description: S3 bucket containing application code (fallback if git clone fails)
+    Default: ''
+
+  CodeSourceKey:
+    Type: String
+    Description: S3 key for application code zip file
+    Default: 'wal-db-stats-collection.zip'
+
+  AssignPublicIP:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Assign a public IP to the EC2 instance. Set to false for private subnet + SSM access (recommended).
+
+  CreateSSMEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Create VPC Interface Endpoints for SSM, SSMMessages, and EC2Messages.
+      Only required when using --no-public-ip in a VPC that does not already have
+      these endpoints. Set to true to create them; set to false (default) if they
+      already exist — the deploy script will reuse them automatically.
+      Cost: ~$0.03/hour ($0.01 per endpoint per AZ) while the stack exists.
+
+  InstallMode:
+    Type: String
+    Default: 'online'
+    AllowedValues: ['online', 'airgapped']
+    Description: >
+      online (default): EC2 clones code from GitHub and installs Python packages
+      from PyPI during bootstrap. Requires outbound internet access (IGW or NAT).
+      airgapped: EC2 installs from a pre-bundled vendor.zip uploaded to S3.
+      No internet access required — all packages and PGSnapper are included.
+      Use with --no-public-ip in subnets with no NAT Gateway or IGW.
+
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      Comma-separated list of route table IDs to associate with the S3 Gateway endpoint
+      in air-gapped mode. Required when InstallMode=airgapped. Get with:
+      aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=<subnet-id>
+      --query 'RouteTables[*].RouteTableId' --output text
+
+  # Per-endpoint creation flags for airgapped mode.
+  # Deploy script sets each to 'true' only if the endpoint does NOT already exist in the VPC.
+  # This prevents 'private DNS conflict' errors when re-deploying into a VPC that already
+  # has some endpoints from a previous run.
+  CreateSSMEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create SSM interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateSSMMessagesEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create SSMMessages interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateEC2MessagesEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create EC2Messages interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateS3Endpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create S3 gateway endpoint (airgapped mode). Set false if already exists.
+
+  CreateRDSEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create RDS interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateMonitoringEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudWatch Monitoring interface endpoint (airgapped mode). Set false if already exists.
+
+  CreatePIEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create Performance Insights interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateCloudFormationEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudFormation interface endpoint (airgapped mode). Set false if already exists.
+
+  CreateSecretsManagerEndpoint:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create Secrets Manager interface endpoint (airgapped mode). Set false if already exists.
+
+  DBSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the Secrets Manager secret containing DB credentials for invasive collection.
+      Leave blank to grant access to all secrets in the account (less secure — use when
+      the secret ARN is not known at deploy time). Provide the ARN to scope access to a
+      single secret (recommended for production deployments).
+  ExistingSSMEndpointSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >
+      (Air-gapped) SG ID of pre-existing SSM/SSMMessages/EC2Messages endpoints.
+      CFN adds TCP/443 from instance SG to this SG before the EC2 wait condition
+      fires, ensuring bootstrap can reach SSM. Auto-detected by deploy script.
+      Leave blank when CFN creates all endpoints.
+
+Conditions:
+  HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
+  NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
+  HasCodeSourceBucket: !Not [!Equals [!Ref CodeSourceBucket, '']]
+  HasDBSecretArn: !Not [!Equals [!Ref DBSecretArn, '']]
+  IsPublicIP: !Equals [!Ref AssignPublicIP, 'true']
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  HasExistingEndpointSG: !Not [!Equals [!Ref ExistingSSMEndpointSecurityGroupId, '']]
+  IsAirgapped: !Equals [!Ref InstallMode, 'airgapped']
+  NeedSSMEndpoints: !And
+    - !Equals [!Ref AssignPublicIP, 'false']
+    - !Equals [!Ref CreateSSMEndpoints, 'true']
+  # Per-endpoint conditions for airgapped mode.
+  # Each is set to true only when the deploy script confirms the endpoint does not
+  # already exist in the VPC — avoiding 'private DNS conflict' errors on re-deploy.
+  NeedSSMEndpoint:             !Equals [!Ref CreateSSMEndpoint, 'true']
+  NeedSSMMessagesEndpoint:     !Equals [!Ref CreateSSMMessagesEndpoint, 'true']
+  NeedEC2MessagesEndpoint:     !Equals [!Ref CreateEC2MessagesEndpoint, 'true']
+  NeedS3Endpoint:              !Equals [!Ref CreateS3Endpoint, 'true']
+  NeedRDSEndpoint:             !Equals [!Ref CreateRDSEndpoint, 'true']
+  NeedMonitoringEndpoint:      !Equals [!Ref CreateMonitoringEndpoint, 'true']
+  NeedPIEndpoint:              !Equals [!Ref CreatePIEndpoint, 'true']
+  NeedCloudFormationEndpoint:  !Equals [!Ref CreateCloudFormationEndpoint, 'true']
+  NeedSecretsManagerEndpoint:  !Equals [!Ref CreateSecretsManagerEndpoint, 'true']
+  # SSM ingress rule needed when any endpoint will be created by this stack
+  NeedEndpointIngressRule: !Or
+    - !Equals [!Ref CreateSSMEndpoints, 'true']
+    - !Equals [!Ref CreateSSMEndpoint, 'true']
+    - !Equals [!Ref CreateSSMMessagesEndpoint, 'true']
+    - !Equals [!Ref CreateEC2MessagesEndpoint, 'true']
+    - !Equals [!Ref CreateRDSEndpoint, 'true']
+    - !Equals [!Ref CreateMonitoringEndpoint, 'true']
+    - !Equals [!Ref CreatePIEndpoint, 'true']
+    - !Equals [!Ref CreateCloudFormationEndpoint, 'true']
+    - !Equals [!Ref CreateSecretsManagerEndpoint, 'true']
+
+Resources:
+  # S3 Bucket for data sharing with SA
+  CustomerDataBucket:
+    Type: AWS::S3::Bucket
+    Condition: NeedToCreateBucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CustomerDataAccessLogBucket
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Application
+          Value: WAL-DB-Stats-Collection
+
+  # Separate bucket for S3 access logs (access logging cannot target itself)
+  CustomerDataAccessLogBucket:
+    Type: AWS::S3::Bucket
+    Condition: NeedToCreateBucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >
+              This bucket IS the access log destination for CustomerDataBucket.
+              AWS prohibits a logging target bucket from logging to itself
+              (circular dependency). A second-level logging bucket would add
+              stack complexity disproportionate to the risk for an auto-generated
+              access log store.
+          - id: W51
+            reason: >
+              Access log destination bucket. Access is fully restricted via
+              PublicAccessBlockConfiguration (all four options enabled).
+              A DenyNonSSL bucket policy is applied via CustomerDataAccessLogBucketPolicy.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >
+              This bucket IS the S3 access log destination for CustomerDataBucket.
+              AWS prohibits a logging target bucket from logging to itself (circular
+              dependency). Matches W35 cfn_nag suppression rationale.
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-access-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # FIX-06: SSL-enforce policy for the access log destination bucket (AwsSolutions-S10)
+  CustomerDataAccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: NeedToCreateBucket
+    Properties:
+      Bucket: !Ref CustomerDataAccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CustomerDataAccessLogBucket.Arn
+              - !Sub '${CustomerDataAccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  CustomerDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: NeedToCreateBucket
+    Properties:
+      Bucket: !Ref CustomerDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CustomerDataBucket.Arn
+              - !Sub '${CustomerDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # IAM Role for data collection only (no Bedrock permissions)
+  CustomerDataCollectionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >
+              RDS Describe, CloudWatch GetMetric/ListMetrics, Performance Insights,
+              and EC2 Describe APIs do not support resource-level ARN restrictions
+              in IAM. Resource: "*" is required for fleet-wide read-only discovery.
+              Secrets Manager and CloudWatch Logs statements use scoped ARNs.
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-DataCollectionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CustomerDataCollectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # FIX-08: SSM Session Manager (replaces AmazonSSMManagedInstanceCore managed policy)
+              - Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+
+              # FIX-08: CloudWatch Agent (replaces CloudWatchAgentServerPolicy managed policy)
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeTags
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                Resource: '*'
+
+              # RDS and Aurora permissions for fleet discovery
+              # W11 suppressed: RDS Describe APIs do not support resource-level ARN scoping
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusterParameters
+                  - rds:DescribeDBParameters
+                  - rds:DescribeDBSubnetGroups
+                  - rds:DescribeDBClusterParameterGroups
+                  - rds:DescribeDBParameterGroups
+                  - rds:ListTagsForResource
+                Resource: '*'
+
+              # CloudWatch and Performance Insights for data collection
+              # W11 suppressed: CW/PI metric APIs do not support resource-level ARN scoping
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricData
+                  - pi:GetResourceMetrics
+                  - pi:DescribeDimensionKeys
+                  - pi:GetDimensionKeyDetails
+                  - pi:ListAvailableResourceDimensions
+                  - pi:ListAvailableResourceMetrics
+                Resource: '*'
+
+              # S3 permissions for data sharing (scoped to specific bucket)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
+
+              # FIX-01: Secrets Manager — scoped to DBSecretArn when provided
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue  # pragma: allowlist secret
+                  - secretsmanager:DescribeSecret  # pragma: allowlist secret
+                Resource: !If
+                  - HasDBSecretArn
+                  - !Ref DBSecretArn
+                  - '*'
+
+              # S3 permissions for code source bucket (if provided)
+              - !If
+                - HasCodeSourceBucket
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${CodeSourceBucket}/*'
+                - !Ref 'AWS::NoValue'
+
+              # EC2 permissions for fleet discovery
+              # W11 suppressed: EC2 Describe APIs do not support resource-level ARN scoping
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:DescribeAvailabilityZones
+                Resource: '*'
+
+              # FIX-02: Logs permissions scoped to account/region (no longer wildcard)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  CustomerDataCollectionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-DataCollectionInstanceProfile'
+      Roles:
+        - !Ref CustomerDataCollectionRole
+
+  # Security Group for data collection
+  CustomerDataCollectionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              GroupName is parameterised with the stack name for operational discoverability.
+              This is a short-lived data collection stack; in-place SG replacement constraints
+              are acceptable.
+          - id: W5
+            reason: >
+              Egress is limited to TCP/443 (HTTPS for AWS APIs, S3, GitHub, PyPI) and the
+              configurable DB port only. Destination IPs are dynamic AWS service endpoints
+              and customer RDS hosts whose CIDRs are unknown at deploy time. No all-port
+              or all-protocol egress is permitted.
+      checkov:
+        skip:
+          - id: CKV_AWS_23
+            comment: >
+              The SSH ingress rule is inside a CFN !If conditional and includes a Description
+              field. Checkov cannot evaluate CloudFormation conditionals and incorrectly
+              flags this as missing a description. All egress rules have explicit Description
+              fields. No rule is missing a description.
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-DataCollectionSG'
+      GroupDescription: Security group for Customer Data Collection EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - !If
+          - IsPublicIP
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AllowedCIDR
+            Description: SSH access
+          - !Ref 'AWS::NoValue'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS APIs, S3, package repos, GitHub, CloudWatch agent, cfn-signal
+        - IpProtocol: tcp
+          FromPort: !Ref DBPort
+          ToPort: !Ref DBPort
+          CidrIp: 0.0.0.0/0
+          Description: PostgreSQL access to customer RDS/Aurora endpoints (invasive collection)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DataCollectionSG'
+
+  # EC2 Instance for data collection only
+  CustomerDataCollectionInstance:
+    Type: AWS::EC2::Instance
+    # Metadata reference to AirgappedS3Endpoint creates an implicit CFN dependency when
+    # NeedS3Endpoint=true — CFN will not start the instance until the S3 Gateway endpoint
+    # is created and its route is active in the route table. This eliminates the race
+    # condition where bootstrap tries to download vendor.zip before the S3 route exists.
+    # When NeedS3Endpoint=false the endpoint pre-exists — route already active, no ordering needed.
+    Metadata:
+      S3EndpointDependency: !If [NeedS3Endpoint, !Ref AirgappedS3Endpoint, 'pre-existing']
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      IamInstanceProfile: !Ref CustomerDataCollectionInstanceProfile
+      Monitoring: true                  # FIX-04: enable 1-min detailed CloudWatch monitoring
+      DisableApiTermination: true       # FIX-05: prevent accidental termination; CFN overrides on stack delete
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref CustomerDataCollectionSecurityGroup
+          AssociatePublicIpAddress: !If [IsPublicIP, true, false]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            DeleteOnTermination: true
+            Encrypted: true             # FIX-03: encrypt EBS root volume at rest
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+          # Update system and install packages
+          # python3.11 is required by collect-and-share.sh and vendor wheels (psycopg2-binary cp311).
+          # In air-gapped mode there is no internet — python3.11 RPMs are bundled in vendor/rpms/.
+          # These are installed after vendor extraction (further below in the airgapped code path).
+          # Other packages (postgresql15, cronie, gcc) are attempted with a short timeout.
+          if [ "${InstallMode}" = "airgapped" ]; then
+            echo "[INFO] Air-gapped mode: installing base packages (python3.11 installed after vendor extraction)..."
+            dnf install -y postgresql15 postgresql15-server gcc cronie cronie-anacron bc \
+              --setopt=timeout=5 --setopt=minrate=1 --setopt=tsflags=nodocs 2>/dev/null || true
+          else
+            dnf update -y
+            dnf install -y git python3.11 python3.11-pip python3-devel python3-pip postgresql15 postgresql15-contrib postgresql15-server postgresql15-server-devel gcc htop cronie cronie-anacron bc
+          fi
+
+          # Determine python3.11 availability — fall back to python3 if not installed
+          if command -v python3.11 &>/dev/null; then
+            PY="python3.11"
+          else
+            PY="python3"
+            echo "[WARN] python3.11 not available, using $(python3 --version)"
+          fi
+          echo "Using Python: $PY ($($PY --version))"
+
+          # Create aliases for convenience (but don't override system python3)
+          echo "alias python=\"$PY\"" >> /home/ec2-user/.bashrc
+          echo "alias pip=\"$PY -m pip\"" >> /home/ec2-user/.bashrc
+
+          # Remove any existing virtual environments
+          sudo -u ec2-user rm -rf /home/ec2-user/wal-db-stats-collection/venv
+
+          # Create application directory
+          sudo -u ec2-user mkdir -p /home/ec2-user/wal-db-stats-collection
+          cd /home/ec2-user/wal-db-stats-collection
+
+          # ── Code setup: online vs airgapped ──────────────────────────────────
+          if [ "${InstallMode}" = "airgapped" ]; then
+            echo "[INFO] Air-gapped mode: downloading vendor bundle from S3..."
+            # The Metadata !If [NeedS3Endpoint, !Ref AirgappedS3Endpoint, 'pre-existing'] on
+            # this instance ensures CFN creates the S3 Gateway endpoint (and its route table
+            # entry) BEFORE launching this instance, so S3 is always reachable on first attempt.
+            if ! aws s3 cp "s3://${CodeSourceBucket}/vendor.zip" /tmp/vendor.zip \
+                --region ${AWS::Region} 2>/dev/null; then
+              echo "[ERROR] Failed to download vendor.zip from S3 — ensure --airgapped was used with deploy script"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            fi
+            echo "[INFO] Vendor bundle downloaded successfully"
+            mkdir -p /opt/vendor
+            unzip -q /tmp/vendor.zip -d /opt/vendor_extract
+            # The deploy script zips vendor/ directory — check top-level directory name
+            if [ -d /opt/vendor_extract/vendor ]; then
+              cp -r /opt/vendor_extract/vendor/. /opt/vendor/
+            elif [ -d /opt/vendor_extract/vendor-bundle ]; then
+              cp -r /opt/vendor_extract/vendor-bundle/. /opt/vendor/
+            else
+              # fallback: zip may contain files directly
+              cp -r /opt/vendor_extract/. /opt/vendor/
+            fi
+            rm -f /tmp/vendor.zip
+            echo "Vendor contents: $(ls /opt/vendor/)"
+
+            # Install python3.11 from bundled RPMs — must happen after vendor extraction
+            if ls /opt/vendor/rpms/python3.11*.rpm &>/dev/null 2>&1; then
+              echo "[INFO] Installing python3.11 from vendor RPMs..."
+              dnf install -y /opt/vendor/rpms/python3.11*.rpm \
+                --setopt=tsflags=nodocs 2>/dev/null \
+                && echo "[INFO] python3.11 $(python3.11 --version 2>&1) installed" \
+                || {
+                  echo "[ERROR] python3.11 RPM install failed — cannot continue"
+                  /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                  exit 1
+                }
+            else
+              echo "[ERROR] /opt/vendor/rpms/python3.11*.rpm not found in vendor bundle"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            fi
+
+            # Install postgresql15 from vendor RPMs — provides libpq required by PyGreSQL
+            if ls /opt/vendor/rpms/postgresql15*.rpm &>/dev/null 2>&1; then
+              dnf install -y /opt/vendor/rpms/postgresql15*.rpm \
+                --setopt=tsflags=nodocs 2>/dev/null \
+                && echo "[INFO] postgresql15 installed from vendor RPMs (libpq available)" \
+                || echo "[WARN] postgresql15 RPM install failed"
+            fi
+
+            echo "[INFO] Air-gapped mode: downloading application code from S3..."
+            aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip \
+                --region ${AWS::Region} || {
+              echo "[ERROR] Failed to download application code from S3"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
+              echo "[ERROR] Code extraction failed"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            rm /tmp/wal-db-stats-collection.zip
+            echo "[OK] Code extracted from S3"
+
+            echo "[INFO] Air-gapped mode: running offline install..."
+            bash /opt/vendor/install.sh || {
+              echo "[ERROR] Offline install failed"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+            echo "[OK] Vendor packages installed offline"
+          else
+            # Try git clone first, fallback to S3
+            echo "[INFO] Attempting to clone repository..."
+            if sudo -u ec2-user git clone https://github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection.git . 2>/dev/null; then
+              echo "[OK] Code cloned from GitHub"
+            elif [ ! -z "${CodeSourceBucket}" ]; then
+              echo "[INFO] Git clone failed, downloading from S3..."
+              aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip || {
+                echo "[ERROR] Both git clone and S3 download failed - deployment cannot continue"
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                exit 1
+              }
+              sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
+                echo "[ERROR] Code extraction failed - deployment cannot continue"
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                exit 1
+              }
+              rm /tmp/wal-db-stats-collection.zip
+              echo "[OK] Code downloaded from S3"
+            else
+              echo "[ERROR] Both git clone and S3 download failed - no code source available"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            fi
+          fi
+          # ─────────────────────────────────────────────────────────────────────
+
+          # Validate required files are present
+          MISSING=""
+          for f in scripts/non_invasive_collector.py scripts/invasive_collector.py utils/fleet_discovery.py utils/pii_redactor.py deployment/collect-and-share.sh requirements.txt; do
+            [ ! -f "$f" ] && MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "[ERROR] Deployment package incomplete — missing:$MISSING"
+            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+            exit 1
+          fi
+
+          # Install Python packages for python3.11 (application code)
+          # Install Python packages (skipped in airgapped mode — handled by vendor/install.sh)
+          if [ "${InstallMode}" != "airgapped" ]; then
+            $PY -m pip install --upgrade pip
+            $PY -m pip install -r requirements.txt || {
+              echo "[ERROR] Requirements installation failed - deployment cannot continue"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            }
+          fi
+
+          # Setup local PostgreSQL for PGPerfStatsSnapper
+          echo "[INFO] Setting up PostgreSQL..."
+
+          # Initialize PostgreSQL database
+          postgresql-setup --initdb
+
+          # Configure PostgreSQL to use trust authentication for local connections
+          sed -i 's/^local.*all.*all.*peer$/local   all             all                                     trust/' /var/lib/pgsql/data/pg_hba.conf
+          sed -i 's/^host.*all.*all.*127.0.0.1\/32.*ident$/host    all             all             127.0.0.1\/32            trust/' /var/lib/pgsql/data/pg_hba.conf
+
+          # Start and enable PostgreSQL service
+          systemctl start postgresql
+          systemctl enable postgresql
+
+          # Start and enable cron service
+          systemctl start crond
+          systemctl enable crond
+
+          # Check PostgreSQL status
+          systemctl status postgresql --no-pager
+
+          # Setup PGPerfStatsSnapper
+          sudo -u ec2-user mkdir -p /home/ec2-user/pgperfstats
+          cd /home/ec2-user/pgperfstats
+          sudo -u ec2-user git clone https://github.com/aws-samples/aurora-and-database-migration-labs.git . || echo "Repository already exists"
+
+          # Install PGSnapper dependencies for python3.9 — skipped in air-gapped mode
+          # (install.sh already installed boto3 and PyGreSQL from vendor bundle)
+          if [ "${InstallMode}" != "airgapped" ]; then
+            python3 -m pip install --upgrade pip
+            python3 -m pip install boto3 psycopg2-binary PyGreSQL
+            $PY -m pip install boto3 psycopg2-binary 2>/dev/null || true
+          fi
+
+          # Download RDS global certificate bundle for SSL connections
+          mkdir -p /certs
+          if [ "${InstallMode}" = "airgapped" ]; then
+            # Use cert from vendor bundle (included at /opt/vendor/global-bundle.pem by install.sh)
+            if [ -f /certs/global-bundle.pem ]; then
+              echo "[INFO] SSL cert loaded from vendor bundle"
+            else
+              echo "[WARN] SSL cert not found — invasive collection will fail"
+            fi
+          else
+            curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+              -o /certs/global-bundle.pem
+          fi
+          [ -f /certs/global-bundle.pem ] && chmod 644 /certs/global-bundle.pem || true
+
+          # Create symlinks for PGSnapper (expects psql at /usr/local/pgsql/bin/)
+          mkdir -p /usr/local/pgsql/bin
+          ln -sf /usr/bin/psql /usr/local/pgsql/bin/psql
+          ln -sf /usr/bin/pg_dump /usr/local/pgsql/bin/pg_dump
+
+          # Fixed SQL queries are already in the repo at scripts/pgsnapper_sql_fixes/
+          # No need to copy - the invasive_collector.py script will use them directly
+
+          # Fix permissions for PGSnapper directories (skip .rpm file if it fails)
+          chmod -R 755 /home/ec2-user/pgperfstats/Code/ 2>/dev/null || true
+          chmod -R 755 /home/ec2-user/pgperfstats/output/ 2>/dev/null || true
+
+          # Make SQL files readable by postgres user for analysis queries
+          chmod -R a+rX /home/ec2-user/pgperfstats 2>/dev/null || true
+
+          # Allow postgres user to traverse /home/ec2-user to access SQL files
+          chmod 755 /home/ec2-user
+
+          # Add PostgreSQL bin to PATH for PGSnapper
+          echo 'export PATH=/usr/pgsql-15/bin:$PATH' >> /home/ec2-user/.bashrc
+          echo 'export LD_LIBRARY_PATH=/usr/pgsql-15/lib' >> /home/ec2-user/.bashrc
+
+          # Set environment variables for data collection
+          cat >> /home/ec2-user/.bashrc << 'EOF'
+          export AWS_REGION=${AWS::Region}
+          export CUSTOMER_DATA_BUCKET="${ResolvedDataBucketName}"
+          export DATA_COLLECTION_MODE=true
+          export AWS_KNOWLEDGE_MCP_REMOTE_URL="https://knowledge-mcp.global.api.aws"
+          export PGPERFSTATS_DIR="/home/ec2-user/pgperfstats"
+
+          # Change to project directory on login
+          cd /home/ec2-user/wal-db-stats-collection
+          EOF
+
+          # Scripts are now packaged in the zip (deployment/collect-and-share.sh, deployment/enable-invasive-collection.sh)
+          # Write config file with deployment-specific values (region, bucket)
+          cat > /home/ec2-user/wal-db-stats-collection/deployment/collection.conf << 'CONF'
+          AWS_REGION=${AWS::Region}
+          CUSTOMER_DATA_BUCKET=${ResolvedDataBucketName}
+          DATA_DIR=/home/ec2-user/wal-db-stats-collection/data
+          CONF
+          sed -i 's/^[[:space:]]*//' /home/ec2-user/wal-db-stats-collection/deployment/collection.conf
+
+          # Symlink scripts to project root for easy access
+          ln -sf /home/ec2-user/wal-db-stats-collection/deployment/collect-and-share.sh                  /home/ec2-user/wal-db-stats-collection/collect-and-share.sh
+          ln -sf /home/ec2-user/wal-db-stats-collection/deployment/enable-invasive-collection.sh                  /home/ec2-user/wal-db-stats-collection/enable-invasive-collection.sh
+          chmod +x /home/ec2-user/wal-db-stats-collection/deployment/collect-and-share.sh
+          chmod +x /home/ec2-user/wal-db-stats-collection/deployment/enable-invasive-collection.sh
+
+          # Set up scheduled data collection if enabled
+          if [ "${EnableScheduledCollection}" = "true" ]; then
+            sudo -u ec2-user crontab -l 2>/dev/null | { cat; echo "${CollectionSchedule} cd /home/ec2-user/wal-db-stats-collection && ./collect-and-share.sh >> /home/ec2-user/wal-db-stats-collection/logs/cron.log 2>&1"; } | sudo -u ec2-user crontab -
+          fi
+
+          # Create systemd service for on-demand collection
+          cat > /etc/systemd/system/db-stats-collection.service << 'EOF'
+          [Unit]
+          Description=Customer Data Collection Service
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          User=ec2-user
+          WorkingDirectory=/home/ec2-user/wal-db-stats-collection
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          Environment=AWS_REGION=${AWS::Region}
+          Environment=CUSTOMER_DATA_BUCKET=${ResolvedDataBucketName}
+          ExecStart=/home/ec2-user/wal-db-stats-collection/collect-and-share.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl enable db-stats-collection
+
+          # Install CloudWatch agent
+          # In airgapped mode, download via S3 VPC endpoint; online mode uses public URL
+          if [ "${InstallMode}" = "airgapped" ]; then
+            aws s3 cp s3://amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm \
+              /tmp/amazon-cloudwatch-agent.rpm --region ${AWS::Region} 2>/dev/null || \
+            aws s3 cp s3://amazoncloudwatch-agent-${AWS::Region}/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm \
+              /tmp/amazon-cloudwatch-agent.rpm --region ${AWS::Region} 2>/dev/null || \
+            echo "[WARN] CloudWatch agent not available in airgapped mode — skipping"
+            [ -f /tmp/amazon-cloudwatch-agent.rpm ] && rpm -U /tmp/amazon-cloudwatch-agent.rpm || true
+          else
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            rpm -U ./amazon-cloudwatch-agent.rpm
+          fi
+
+          # Remove wrapper scripts (no longer needed)
+          # Set permissions
+          chown -R ec2-user:ec2-user /home/ec2-user/wal-db-stats-collection
+
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-DataCollection'
+        - Key: Application
+          Value: WAL-DB-Stats-Collection
+        - Key: Environment
+          Value: Production
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT40M
+
+  # CloudWatch Log Group
+  CustomerDataCollectionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: >
+              This log group contains only EC2 UserData bootstrap output (package installs,
+              git clone status, cfn-signal). No customer data or PII is written here.
+              KMS encryption is omitted to avoid requiring customers to pre-create a CMK
+              and configure a CloudWatch Logs key access policy, which adds deployment
+              friction disproportionate to the risk for a 30-day bootstrap log.
+              CloudWatch Logs applies SSE at rest regardless.
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: >
+              Bootstrap-only log group (EC2 UserData output: package installs, git clone,
+              cfn-signal). No customer data or PII. KMS CMK would require customers to
+              pre-create a key and configure CloudWatch Logs access — disproportionate
+              burden for a 30-day bootstrap log. Matches W84 cfn_nag rationale.
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/db-stats-collection/${AWS::StackName}'
+      RetentionInDays: 30
+
+  # ── VPC Interface Endpoints for SSM Session Manager (--no-public-ip mode) ──
+  # Created only when AssignPublicIP=false AND CreateSSMEndpoints=true.
+  # Skip if the VPC already has these endpoints — the deploy script reuses them.
+  # Allow instance to reach VPC endpoints on TCP/443 (self-referencing rule)
+  # Only needed when CFN creates the endpoints (Pattern B) — endpoint SG = instance SG
+  SSMEndpointIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NeedEndpointIngressRule
+    Properties:
+      GroupId: !Ref CustomerDataCollectionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
+      Description: Allow instance to reach VPC endpoints on TCP/443 (self-referencing)
+
+  # ── Inbound rule on pre-existing endpoint SG (air-gapped, pre-existing endpoints) ──
+  # When SSM/SSMMessages/EC2Messages endpoints already exist in the VPC and use a
+  # different SG (e.g. default SG), the instance SG must be allowed inbound on TCP/443
+  # on that endpoint SG. Without this, cfn-signal and SSM agent timeout during bootstrap.
+  PreExistingEndpointIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExistingEndpointSG
+    Properties:
+      GroupId: !Ref ExistingSSMEndpointSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
+      Description: !Sub 'Allow ${AWS::StackName} instance to reach pre-existing VPC endpoints on TCP/443'
+
+  # ── SSM endpoints for --no-public-ip --create-ssm-endpoints (Pattern B) ──
+  SSMInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SSMMessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  EC2MessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # ── VPC Endpoints for air-gapped mode (--airgapped / InstallMode=airgapped) ──
+  # Each endpoint has its own condition. The deploy script checks whether the endpoint
+  # already exists in the VPC and only passes 'true' for missing ones — avoiding
+  # 'private DNS conflict' errors when re-deploying into a VPC with existing endpoints.
+
+  # SSM endpoints for Session Manager connectivity (airgapped mode always needs these)
+  AirgappedSSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  AirgappedSSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMMessagesEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  AirgappedEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedEC2MessagesEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # S3 Gateway endpoint — allows EC2 to download code + vendor bundle from S3
+  AirgappedS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedS3Endpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  # RDS endpoint — allows collection scripts to call RDS Describe APIs
+  AirgappedRDSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedRDSEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.rds'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # CloudWatch Monitoring endpoint — allows CloudWatch metrics collection
+  AirgappedMonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedMonitoringEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # Performance Insights endpoint — for PI metrics collection
+  AirgappedPIEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedPIEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.pi'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # CloudFormation endpoint — required for cfn-signal in airgapped mode
+  AirgappedCloudFormationEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedCloudFormationEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # Secrets Manager endpoint — allows invasive collection to retrieve DB credentials
+  AirgappedSecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSecretsManagerEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+Outputs:
+  InstanceId:
+    Description: Instance ID of the Customer Data Collection EC2 instance
+    Value: !Ref CustomerDataCollectionInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstanceSecurityGroup:
+    Description: Security group ID of the EC2 instance (needed to configure pre-existing SSM VPC endpoints)
+    Value: !Ref CustomerDataCollectionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceSecurityGroup'
+
+  PublicIP:
+    Description: Public IP address of the Customer Data Collection EC2 instance (empty when --no-public-ip)
+    Value: !If
+      - IsPublicIP
+      - !GetAtt CustomerDataCollectionInstance.PublicIp
+      - 'N/A - Private subnet deployment (use SSM)'
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIP'
+
+  PrivateIP:
+    Description: Private IP address of the Customer Data Collection EC2 instance
+    Value: !GetAtt CustomerDataCollectionInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+
+  CustomerDataBucket:
+    Description: S3 bucket for sharing data with SA
+    Value: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataBucket'
+
+  SSHCommand:
+    Description: Command to connect to the instance
+    Value: !If
+      - IsPublicIP
+      - !Sub
+        - 'ssh -i ${KP}.pem ec2-user@${IP}'
+        - KP: !Ref KeyPairName
+          IP: !GetAtt CustomerDataCollectionInstance.PublicIp
+      - !Sub 'aws ssm start-session --target ${CustomerDataCollectionInstance} --region ${AWS::Region}'
+
+  DataCollectionCommand:
+    Description: Command to run data collection and sharing
+    Value: './collect-and-share.sh'
+
+  InvasiveCollectionCommand:
+    Description: Command to enable invasive data collection with PGPerfStatsSnapper
+    Value: './enable-invasive-collection.sh <cluster-id> <db-host> <db-user> <db-secret-arn> [db-name] [pgsnapper-min-days] [pgsnapper-interval] [skip-pg-stat-statements]'
+
+  ServiceCommand:
+    Description: Command to run data collection as a service
+    Value: 'sudo systemctl start db-stats-collection'
+
+  ScheduledCollection:
+    Description: Scheduled data collection configuration
+    Value: !Sub 'Enabled: ${EnableScheduledCollection}, Schedule: ${CollectionSchedule}'
+
+  SAInstructions:
+    Description: S3 location of collected DB stats
+    Value: !Sub 'Collected DB stats available at: s3://${ResolvedDataBucketName}/db-stats/'
