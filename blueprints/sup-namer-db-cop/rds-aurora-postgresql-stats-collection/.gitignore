@@ -1,0 +1,16 @@
+# Build artifacts created by deploy script at runtime
+*.zip
+/data/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Temporary test/helper scripts
+run-e2e.sh
+check-result.sh
+git-*.sh
+ssm-*.json
+deploy-e2e-*.log
+test_ak.txt
+test_sk.txt

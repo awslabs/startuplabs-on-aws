@@ -1,0 +1,17 @@
+This project depends on third-party open source packages. Their licenses are listed below.
+
+| Package | License | Notes |
+|---------|---------|-------|
+| boto3 | Apache-2.0 | AWS SDK for Python |
+| botocore | Apache-2.0 | AWS SDK core |
+| psycopg2-binary | LGPL-3.0 | PostgreSQL adapter for Python |
+| jmespath | MIT | JSON query language |
+| python-dateutil | Apache-2.0 / BSD-3-Clause | Date utilities |
+| s3transfer | Apache-2.0 | S3 multipart transfer |
+| six | MIT | Python 2/3 compatibility |
+| urllib3 | MIT | HTTP client |
+| PGPerfStatsSnapper | MIT | PostgreSQL performance stats snapshots (aws-samples/aurora-and-database-migration-labs) |
+
+No third-party source code, datasets, or ML models are bundled or redistributed here.
+Python packages are downloaded at runtime (online mode) or pre-bundled as binary wheels (airgapped mode).
+PGPerfStatsSnapper is cloned at runtime (online mode) or included as source in vendor/pgsnapper/ (airgapped mode).
