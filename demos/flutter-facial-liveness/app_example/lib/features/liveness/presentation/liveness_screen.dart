@@ -21,6 +21,16 @@ class _LivenessScreenState extends ConsumerState<LivenessScreen> {
 
   Future<void> _startSession() async {
     setState(() => _loading = true);
+    // Ask before creating the session: the Android detector fails without it,
+    // and on iOS the prompt would interrupt the challenge.
+    final granted = await LivenessPermissions.requestCamera();
+    if (!granted) {
+      setState(() {
+        _status = 'Camera permission is required for the liveness check';
+        _loading = false;
+      });
+      return;
+    }
     try {
       final repo = ref.read(livenessRepositoryProvider);
       final sessionId = await repo.createSession();
@@ -68,17 +78,15 @@ class _LivenessScreenState extends ConsumerState<LivenessScreen> {
           sessionId: _sessionId!,
           region: AppConfig.region,
           credentialsProvider: credProvider,
-          onComplete: (result) {
-            setState(() {
-              _showDetector = false;
-              _result = result;
-            });
+          onComplete: (_) {
+            // The native detector returns no verdict; the backend decides.
+            setState(() => _showDetector = false);
             _fetchResult();
           },
           onError: (error) {
             setState(() {
               _showDetector = false;
-              _status = 'Error: ${error.message}';
+              _status = 'Error (${error.code.name}): ${error.message}';
             });
           },
         ),

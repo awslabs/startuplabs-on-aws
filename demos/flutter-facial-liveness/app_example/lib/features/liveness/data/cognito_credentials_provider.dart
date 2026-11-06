@@ -54,10 +54,17 @@ class CognitoCredentialsProvider implements LivenessCredentialsProvider {
     final creds = (jsonDecode(getCredsResponse.body)
         as Map<String, dynamic>)['Credentials'] as Map<String, dynamic>;
 
+    // Cognito returns Expiration as epoch seconds (a JSON number).
+    final expirationSeconds = (creds['Expiration'] as num).toDouble();
+
     return LivenessCredentials(
       accessKeyId: creds['AccessKeyId'] as String,
       secretAccessKey: creds['SecretKey'] as String,
       sessionToken: creds['SessionToken'] as String,
+      expiration: DateTime.fromMillisecondsSinceEpoch(
+        (expirationSeconds * 1000).round(),
+        isUtc: true,
+      ),
     );
   }
 }

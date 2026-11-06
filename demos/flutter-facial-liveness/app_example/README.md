@@ -2,7 +2,7 @@
 
 Example Flutter app (Android/iOS) that captures an image and analyzes it with
 Amazon Rekognition through the `rekognition_client` wrapper, and runs the
-Face Liveness flow through the `rekognition_liveness` native plugin (iOS).
+Face Liveness flow through the `rekognition_liveness` native plugin (iOS and Android).
 
 ## Architecture
 
@@ -18,7 +18,7 @@ lib/
       providers.dart                         # DI (Riverpod)
       face_analysis_controller.dart          # StateNotifier + immutable state
       face_analysis_screen.dart              # UI
-  features/liveness/                         # Face Liveness flow (iOS native view)
+  features/liveness/                         # Face Liveness flow (native view, iOS and Android)
 ```
 
 The UI depends on `FaceAnalysisRepository` (abstraction), never on the

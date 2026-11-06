@@ -107,13 +107,35 @@ int _deepHash(Object? value) {
 }
 
 
+/// Stable error codes shared by iOS and Android, so Dart can decide between
+/// retry, step-up or a user message without comparing strings.
+enum LivenessErrorCode {
+  unknown,
+  sessionNotFound,
+  accessDenied,
+  cameraPermissionDenied,
+  cameraNotAvailable,
+  sessionInterrupted,
+  sessionTimedOut,
+  faceCheckFailed,
+  unsupportedChallenge,
+  userCancelled,
+  videoEncoding,
+  serviceError,
+  sdkNotLinked,
+  credentialsUnavailable,
+  platformNotSupported,
+}
+
 /// Temporary AWS credentials handed to the native liveness SDK, which signs the
-/// WebSocket to Amazon Rekognition directly.
+/// WebSocket to Amazon Rekognition directly. The SDK fetches them once per
+/// session and never refreshes, so the real expiration must travel with them.
 class LivenessCredentialsMessage {
   LivenessCredentialsMessage({
     required this.accessKeyId,
     required this.secretAccessKey,
     required this.sessionToken,
+    required this.expirationEpochSeconds,
   });
 
   String accessKeyId;
@@ -122,11 +144,14 @@ class LivenessCredentialsMessage {
 
   String sessionToken;
 
+  int expirationEpochSeconds;
+
   List<Object?> _toList() {
     return <Object?>[
       accessKeyId,
       secretAccessKey,
       sessionToken,
+      expirationEpochSeconds,
     ];
   }
 
@@ -139,6 +164,7 @@ class LivenessCredentialsMessage {
       accessKeyId: result[0]! as String,
       secretAccessKey: result[1]! as String,
       sessionToken: result[2]! as String,
+      expirationEpochSeconds: result[3]! as int,
     );
   }
 
@@ -151,7 +177,7 @@ class LivenessCredentialsMessage {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(accessKeyId, other.accessKeyId) && _deepEquals(secretAccessKey, other.secretAccessKey) && _deepEquals(sessionToken, other.sessionToken);
+    return _deepEquals(accessKeyId, other.accessKeyId) && _deepEquals(secretAccessKey, other.secretAccessKey) && _deepEquals(sessionToken, other.sessionToken) && _deepEquals(expirationEpochSeconds, other.expirationEpochSeconds);
   }
 
   @override
@@ -160,59 +186,45 @@ class LivenessCredentialsMessage {
 
   @override
   String toString() {
-    return 'LivenessCredentialsMessage(accessKeyId: $accessKeyId, secretAccessKey: $secretAccessKey, sessionToken: $sessionToken)';
+    return 'LivenessCredentialsMessage(accessKeyId: $accessKeyId, secretAccessKey: $secretAccessKey, sessionToken: $sessionToken, expirationEpochSeconds: $expirationEpochSeconds)';
   }
 }
 
-/// Result of a completed liveness check, surfaced by the native SDK.
-class LivenessResultMessage {
-  LivenessResultMessage({
+/// The native SDK finished streaming. It carries no verdict on either
+/// platform: the backend reads the result with GetFaceLivenessSessionResults.
+class LivenessCompletionMessage {
+  LivenessCompletionMessage({
     required this.sessionId,
-    required this.isLive,
-    required this.confidence,
-    this.referenceImage,
   });
 
   String sessionId;
 
-  bool isLive;
-
-  double confidence;
-
-  Uint8List? referenceImage;
-
   List<Object?> _toList() {
     return <Object?>[
       sessionId,
-      isLive,
-      confidence,
-      referenceImage,
     ];
   }
 
   Object encode() {
     return _toList();  }
 
-  static LivenessResultMessage decode(Object result) {
+  static LivenessCompletionMessage decode(Object result) {
     result as List<Object?>;
-    return LivenessResultMessage(
+    return LivenessCompletionMessage(
       sessionId: result[0]! as String,
-      isLive: result[1]! as bool,
-      confidence: result[2]! as double,
-      referenceImage: result[3] as Uint8List?,
     );
   }
 
   @override
   // ignore: avoid_equals_and_hash_code_on_mutable_classes
   bool operator ==(Object other) {
-    if (other is! LivenessResultMessage || other.runtimeType != runtimeType) {
+    if (other is! LivenessCompletionMessage || other.runtimeType != runtimeType) {
       return false;
     }
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(sessionId, other.sessionId) && _deepEquals(isLive, other.isLive) && _deepEquals(confidence, other.confidence) && _deepEquals(referenceImage, other.referenceImage);
+    return _deepEquals(sessionId, other.sessionId);
   }
 
   @override
@@ -221,7 +233,7 @@ class LivenessResultMessage {
 
   @override
   String toString() {
-    return 'LivenessResultMessage(sessionId: $sessionId, isLive: $isLive, confidence: $confidence, referenceImage: $referenceImage)';
+    return 'LivenessCompletionMessage(sessionId: $sessionId)';
   }
 }
 
@@ -232,7 +244,7 @@ class LivenessErrorMessage {
     required this.message,
   });
 
-  String code;
+  LivenessErrorCode code;
 
   String message;
 
@@ -249,7 +261,7 @@ class LivenessErrorMessage {
   static LivenessErrorMessage decode(Object result) {
     result as List<Object?>;
     return LivenessErrorMessage(
-      code: result[0]! as String,
+      code: result[0]! as LivenessErrorCode,
       message: result[1]! as String,
     );
   }
@@ -284,14 +296,17 @@ class _PigeonCodec extends StandardMessageCodec {
     if (value is int) {
       buffer.putUint8(4);
       buffer.putInt64(value);
-    }    else if (value is LivenessCredentialsMessage) {
+    }    else if (value is LivenessErrorCode) {
       buffer.putUint8(129);
-      writeValue(buffer, value.encode());
-    }    else if (value is LivenessResultMessage) {
+      writeValue(buffer, value.index);
+    }    else if (value is LivenessCredentialsMessage) {
       buffer.putUint8(130);
       writeValue(buffer, value.encode());
-    }    else if (value is LivenessErrorMessage) {
+    }    else if (value is LivenessCompletionMessage) {
       buffer.putUint8(131);
+      writeValue(buffer, value.encode());
+    }    else if (value is LivenessErrorMessage) {
+      buffer.putUint8(132);
       writeValue(buffer, value.encode());
     } else {
       super.writeValue(buffer, value);
@@ -302,10 +317,13 @@ class _PigeonCodec extends StandardMessageCodec {
   Object? readValueOfType(int type, ReadBuffer buffer) {
     switch (type) {
       case 129:
-        return LivenessCredentialsMessage.decode(readValue(buffer)!);
+        final value = readValue(buffer) as int?;
+        return value == null ? null : LivenessErrorCode.values[value];
       case 130:
-        return LivenessResultMessage.decode(readValue(buffer)!);
+        return LivenessCredentialsMessage.decode(readValue(buffer)!);
       case 131:
+        return LivenessCompletionMessage.decode(readValue(buffer)!);
+      case 132:
         return LivenessErrorMessage.decode(readValue(buffer)!);
       default:
         return super.readValueOfType(type, buffer);
@@ -313,9 +331,9 @@ class _PigeonCodec extends StandardMessageCodec {
   }
 }
 
-/// Dart -> native. Called once, after the platform view is created and Cognito
+/// Dart -> native. Called once, after the platform view is created and
 /// credentials have been fetched. Receiving credentials is the signal for the
-/// native side to present the FaceLivenessDetectorView.
+/// native side to present the liveness detector.
 class LivenessHostApi {
   /// Constructor for [LivenessHostApi]. The [binaryMessenger] named argument is
   /// available for dependency injection. If it is left null, the default
@@ -348,11 +366,46 @@ class LivenessHostApi {
   }
 }
 
+/// Dart -> native, app-wide (no channel suffix). The Android SDK does not ask
+/// for the camera permission itself, so the app asks before showing the view.
+class LivenessPermissionApi {
+  /// Constructor for [LivenessPermissionApi]. The [binaryMessenger] named argument is
+  /// available for dependency injection. If it is left null, the default
+  /// BinaryMessenger will be used which routes to the host platform.
+  LivenessPermissionApi({BinaryMessenger? binaryMessenger, String messageChannelSuffix = ''})
+      : pigeonVar_binaryMessenger = binaryMessenger,
+        pigeonVar_messageChannelSuffix = messageChannelSuffix.isNotEmpty ? '.$messageChannelSuffix' : '';
+  final BinaryMessenger? pigeonVar_binaryMessenger;
+
+  static const MessageCodec<Object?> pigeonChannelCodec = _PigeonCodec();
+
+  final String pigeonVar_messageChannelSuffix;
+
+  Future<bool> requestCameraPermission() async {
+    final pigeonVar_channelName = 'dev.flutter.pigeon.rekognition_liveness.LivenessPermissionApi.requestCameraPermission$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(null);
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+        pigeonVar_replyList,
+        pigeonVar_channelName,
+        isNullValid: false,
+    )
+    ;
+    return pigeonVar_replyValue! as bool;
+  }
+}
+
 /// Native -> Dart. Terminal callbacks; exactly one fires per session.
 abstract class LivenessFlutterApi {
   static const MessageCodec<Object?> pigeonChannelCodec = _PigeonCodec();
 
-  void onComplete(LivenessResultMessage result);
+  void onComplete(LivenessCompletionMessage completion);
 
   void onError(LivenessErrorMessage error);
 
@@ -367,9 +420,9 @@ abstract class LivenessFlutterApi {
       } else {
         pigeonVar_channel.setMessageHandler((Object? message) async {
           final List<Object?> args = message! as List<Object?>;
-          final LivenessResultMessage arg_result = args[0]! as LivenessResultMessage;
+          final LivenessCompletionMessage arg_completion = args[0]! as LivenessCompletionMessage;
           try {
-            api.onComplete(arg_result);
+            api.onComplete(arg_completion);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);
