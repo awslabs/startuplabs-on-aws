@@ -1,0 +1,124 @@
+# modular-monolith-aws-emulator. `just` lists every recipe.
+
+set dotenv-load := true
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+port := env("EMULATOR_PORT", "9297")
+api_port := env("APP_PORT", "8080")
+legacy_port := "8081"
+emulator_arch := if arch() == "aarch64" { "aarch64" } else { "x86_64" }
+compose := "EMULATOR_ARCH=" + emulator_arch + " EMULATOR_PORT=" + port + " EMULATOR_UID=$(id -u) EMULATOR_GID=$(id -g) docker compose"
+
+export APP_EMULATOR_PORT := port
+
+# List recipes
+default:
+    @just --list --unsorted
+
+# Install Python deps (uv) and build the AWS Emulator image
+install:
+    @command -v uv >/dev/null || { echo "uv not found: https://docs.astral.sh/uv/"; exit 1; }
+    @command -v docker >/dev/null || { echo "docker not found"; exit 1; }
+    uv sync --all-extras --all-groups
+    mkdir -p "$HOME/.aws/emulator"
+    {{compose}} build aws-emulator
+    @echo "done. next: just dev"
+
+# Emulator + bootstrap + legacy stub + API with reload on http://127.0.0.1:8080
+dev: bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run uvicorn app.legacy.app:app --host 127.0.0.1 --port {{legacy_port}} --log-level warning &
+    legacy_pid=$!
+    trap 'kill $legacy_pid 2>/dev/null || true' EXIT
+    export APP_LEGACY_BASE_URL="http://127.0.0.1:{{legacy_port}}"
+    export APP_IDENTITY_AUTO_CONFIRM=true
+    echo "API     http://127.0.0.1:{{api_port}}/docs"
+    echo "legacy  http://127.0.0.1:{{legacy_port}} (behind the strangler proxy)"
+    uv run uvicorn app.main:create_app --factory --reload --reload-dir src \
+        --host 127.0.0.1 --port {{api_port}}
+
+# Lint + types + architecture + unit + integration (emulator)
+test: lint test-unit test-integration
+
+# Explain the architecture, modules, routes and adapters (computed from code)
+explain:
+    @uv run app-explain
+
+# Unit tests: in-memory adapters, no emulator needed
+test-unit:
+    uv run pytest -m "not integration" --cov=app --cov-report=term-missing:skip-covered
+
+# Integration tests against the AWS Emulator (starts it and bootstraps)
+test-integration: bootstrap
+    uv run pytest -m integration
+
+# ruff, mypy and import-linter (module boundaries)
+lint:
+    uv run ruff check src tests functions infra
+    uv run ruff format --check src tests functions infra
+    uv run mypy
+    uv run mypy infra
+    uv run lint-imports
+
+# Auto-format and fix lint
+fmt:
+    uv run ruff format src tests functions infra
+    uv run ruff check --fix src tests functions infra
+
+# Start the emulator (loopback only) and wait for it
+emulator-up:
+    mkdir -p "$HOME/.aws/emulator"
+    @if [ "$(docker inspect -f '{{"{{"}}.State.Running{{"}}"}}' aws-emulator-sup 2>/dev/null)" = "true" ]; then \
+        echo "aws-emulator-sup already running, reusing it"; \
+    else {{compose}} up -d aws-emulator; fi
+    ./scripts/wait-emulator.sh {{port}}
+
+# Stop the emulator (its state is in memory and is discarded)
+emulator-down:
+    {{compose}} down
+
+# Follow emulator logs
+emulator-logs:
+    {{compose}} logs -f aws-emulator
+
+# Provision Cognito, Aurora (Data API), DynamoDB, S3, Lambda, VPC, Cloud Map in the emulator
+bootstrap: emulator-up
+    uv run app-bootstrap
+
+# Add a registered user to the admin group
+admin email:
+    uv run app-bootstrap --grant-admin {{email}}
+
+# Run only the legacy stub
+legacy:
+    uv run uvicorn app.legacy.app:app --host 127.0.0.1 --port {{legacy_port}}
+
+# End-to-end walkthrough against a running `just dev`
+demo:
+    ./scripts/demo.sh http://127.0.0.1:{{api_port}}
+
+# ---------------------------------------------------------------- AWS (CDK)
+# Deploy to the AWS account of the active credentials, with a live dashboard
+rollout *args:
+    uv run --all-extras --group infra python -m infra.rollout rollout {{args}}
+
+# Live health of every deployed service (r refresh, q quit; --once for one pass)
+status *args:
+    uv run --all-extras --group infra python -m infra.rollout status {{args}}
+
+# Delete the deployed stacks (asks you to type the stack prefix)
+destroy *args:
+    uv run --all-extras --group infra python -m infra.rollout destroy {{args}}
+
+# Build the API Lambda bundle and synth both stacks with cdk-nag
+synth: build-lambda
+    JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION=1 npx -y aws-cdk@2.1148.1 synth --quiet
+
+# Build build/lambda (arm64, python3.12) without Docker
+build-lambda:
+    uv run --all-extras --group infra python -m infra.build_lambda
+
+# One-time CDK bootstrap of the current account/region
+cdk-bootstrap:
+    JSII_SILENCE_WARNING_DEPRECATED_NODE_VERSION=1 npx -y aws-cdk@2.1148.1 bootstrap
