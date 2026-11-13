@@ -1,0 +1,127 @@
+{
+  "name": "modular-monolith-aws-emulator - dev stage (us-east-1)",
+  "services": {
+    "ApiGateway": {
+      "serviceCode": "AmazonApiGateway",
+      "description": "HTTP API (sup-dev-api)",
+      "calculationComponents": {
+        "apiType": "HTTP",
+        "requestsPerMonth": 100000,
+        "avgRequestSizeKB": 2
+      }
+    },
+    "LambdaApi": {
+      "serviceCode": "AWSLambda",
+      "description": "API Lambda (FastAPI, arm64)",
+      "calculationComponents": {
+        "requestsPerMonth": 100000,
+        "avgDurationMs": 200,
+        "memoryMB": 512,
+        "architecture": "arm64",
+        "includeFreeTier": false
+      }
+    },
+    "LambdaWordCount": {
+      "serviceCode": "AWSLambda",
+      "description": "word-count Lambda",
+      "calculationComponents": {
+        "requestsPerMonth": 5000,
+        "avgDurationMs": 20,
+        "memoryMB": 128,
+        "architecture": "arm64",
+        "includeFreeTier": false
+      }
+    },
+    "Cognito": {
+      "serviceCode": "AmazonCognito",
+      "description": "User pool, Essentials plan",
+      "calculationComponents": {
+        "featurePlan": "Essentials",
+        "monthlyActiveUsers": 50
+      }
+    },
+    "Aurora": {
+      "serviceCode": "AuroraPostgreSQL",
+      "description": "Aurora PostgreSQL Serverless v2, 0-2 ACU, auto-pause",
+      "calculationComponents": {
+        "deployment": "serverless-v2",
+        "acu": 0.05,
+        "storageAmount": 1,
+        "baselineIORate": 1,
+        "peakIORate": 20,
+        "peakIODuration": 30
+      }
+    },
+    "DynamoDB": {
+      "serviceCode": "AmazonDynamoDB",
+      "description": "profiles table, on-demand",
+      "calculationComponents": {
+        "capacityMode": "on-demand",
+        "storageGB": 1,
+        "readRequestsPerMonth": 100000,
+        "writeRequestsPerMonth": 20000
+      }
+    },
+    "S3": {
+      "serviceCode": "AmazonS3",
+      "description": "assets + access-log buckets",
+      "calculationComponents": {
+        "storageAmount": 2,
+        "putRequests": 15000,
+        "getRequests": 20000
+      }
+    },
+    "SecretsManager": {
+      "serviceCode": "AWSSecretsManager",
+      "description": "Aurora master secret (Data API)",
+      "calculationComponents": {
+        "numberOfSecrets": 1,
+        "apiCallsPerMonth": 100000
+      }
+    },
+    "CloudWatch": {
+      "serviceCode": "AmazonCloudWatch",
+      "description": "Lambda, API access, VPC flow and Aurora logs",
+      "calculationComponents": {
+        "metricsCount": 0,
+        "logIngestionGB": 1,
+        "dashboards": 0
+      }
+    },
+    "XRay": {
+      "serviceCode": "AWSXRay",
+      "description": "API Lambda active tracing",
+      "calculationComponents": {
+        "requestsPerMonth": 100000,
+        "samplingRatePercent": 5,
+        "queriesPerMonth": 100,
+        "tracesRetrievedPerQuery": 20
+      }
+    },
+    "SNS": {
+      "serviceCode": "AmazonSNS",
+      "description": "alarm topic",
+      "calculationComponents": {
+        "requestsPerMonth": 100,
+        "notificationProtocol": "email"
+      }
+    },
+    "CloudMap": {
+      "serviceCode": "AWSCloudMap",
+      "description": "private DNS namespace sup-dev.local",
+      "calculationComponents": {
+        "registeredViaEcs": false,
+        "registeredInstances": 0,
+        "dnsServices": 1,
+        "dnsNamespaces": 1,
+        "dnsQueriesPerServicePerMonth": 0
+      }
+    }
+  },
+  "metaData": {
+    "assumptions": {
+      "region": "us-east-1 (N. Virginia)",
+      "stage": "dev, light use, Aurora paused most of the day"
+    }
+  }
+}

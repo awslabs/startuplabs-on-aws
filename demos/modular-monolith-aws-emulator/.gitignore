@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.env
+.platform/
+.DS_Store
+build/
+cdk.out/
+cdk.context.json
+.import_linter_cache/
