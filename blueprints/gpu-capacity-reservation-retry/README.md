@@ -306,6 +306,9 @@ On-Demand rate.
   zones, run one request per zone, each with its own `NAME`.
 - Only one copy should run per `NAME` at a time. See
   [Partial results and running it again](#partial-results-and-running-it-again).
+- The protection against booking twice holds within one run. If you stop the
+  script while it is creating a reservation, wait a minute before you run it
+  again, so that AWS lists any reservation that the stopped call created.
 - The script stops when its terminal closes or the computer sleeps. For a long
   search, run it on a small EC2 instance as described in [How to run](#how-to-run).
 
@@ -332,6 +335,7 @@ because no g7e.48xlarge capacity was available during testing:
 | Stand-in AWS CLI where the "try for 1" call loses the connection after AWS created the reservation, and AWS lists it late | It repeated the call for 1 with the same token, then reserved the other 2, and the request ended with exactly 3 |
 | Stand-in AWS CLI where credentials expire between rounds | It stopped at the next listing with the `ExpiredToken` error and exit code 1. A permissions error on listing stopped it the same way |
 | Stand-in AWS CLI where one of two cancels fails | It cancelled the other, said which one failed, and exited with an error |
+| Stand-in AWS CLI that prints a warning on stderr when a create succeeds | It recorded the reservation and continued. It reads the ID from stdout only |
 | An unknown argument, such as `--cancle` | It stopped before calling AWS |
 | Real run with `t3.micro` in `usw2-az1`, zone given as a zone ID | Reserved 2; running again booked nothing; raising `COUNT` to 3 booked 1 more; the same `NAME` with `t3.small` stopped; an instance type not offered and a wrong `ACCOUNT_ID` stopped with exit code 1; `--cancel` removed all 3, and a second `--cancel` found nothing |
 | IAM policy above, with a real Region and account filled in | The IAM policy simulator allowed every action the script calls in that Region, denied them in another Region, and denied tagging after creation and cancelling untagged reservations |

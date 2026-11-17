@@ -185,7 +185,7 @@ RETRY_TOKEN=""; RETRY_TOKEN_COUNT=""
 # 2 on a temporary error (throttling, network, AWS internal error).
 # Exits on any other error, such as quota or permissions.
 reserve() {
-  local out token
+  local out err token
   # Same token on the AWS CLI's own retries, so a request that timed out but
   # succeeded is not created twice. Max 64 characters.
   if [[ -n "$RETRY_TOKEN" && "$RETRY_TOKEN_COUNT" == "$1" ]]; then
@@ -194,26 +194,30 @@ reserve() {
     token="${NAME:0:40}-$(date +%s)-$RANDOM"
   fi
   RETRY_TOKEN=""
+  # stdout holds only the reservation ID. stderr goes to a file, so that a
+  # warning from the AWS CLI cannot hide a reservation that AWS did create.
   out=$(aws ec2 create-capacity-reservation \
     --availability-zone "$ZONE_NAME" --instance-type "$INSTANCE_TYPE" \
     --instance-platform Linux/UNIX --instance-count "$1" \
     --instance-match-criteria open --end-date-type unlimited \
     --client-token "$token" \
     --tag-specifications "ResourceType=capacity-reservation,Tags=[{Key=$TAG_KEY,Value=$NAME},{Key=Name,Value=$NAME}]" \
-    --query CapacityReservation.CapacityReservationId --output text 2>&1)
-  if [[ "$out" == cr-* ]]; then
+    --query CapacityReservation.CapacityReservationId --output text 2>"$ERR_FILE")
+  err=$(cat "$ERR_FILE")
+  if [[ "$out" =~ ^(cr-[0-9a-f]+) ]]; then
+    out=${BASH_REMATCH[1]}
     CREATED+=("$out $1")
     echo "$(date '+%H:%M:%S') reserved $1 ($out) - billing has started"; return 0
   fi
-  if [[ "$out" == *InsufficientInstanceCapacity* ]]; then
+  if [[ "$err" == *InsufficientInstanceCapacity* ]]; then
     echo "$(date '+%H:%M:%S') no capacity for $1"; return 1
   fi
-  if is_temporary "$out"; then
+  if is_temporary "$err"; then
     RETRY_TOKEN="$token"; RETRY_TOKEN_COUNT="$1"
-    echo "$(date '+%H:%M:%S') temporary AWS error, will try again: ${out%%$'\n'*}"; return 2
+    echo "$(date '+%H:%M:%S') temporary AWS error, will try again: ${err%%$'\n'*}"; return 2
   fi
   fail "AWS returned an error that retrying will not fix:
-$out"
+$err$out"
 }
 
 count_held || fail "Could not list the reservations of '$NAME' in $AWS_REGION:
