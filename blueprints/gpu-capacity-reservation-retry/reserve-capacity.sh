@@ -127,15 +127,35 @@ OFFERED=$(aws ec2 describe-instance-type-offerings --location-type availability-
 # a re-count straight after a success could come up short and book extra.
 CREATED=()
 
+# AWS errors that can clear on their own: throttling, AWS internal errors and
+# lost connections. The script retries these and stops on anything else, such
+# as expired credentials, a permissions error or a quota error.
+is_temporary() {
+  case "$1" in
+    *RequestLimitExceeded*|*Throttling*|*InternalError*|*ServiceUnavailable*|*"(Unavailable)"*|\
+    *"Could not connect to the endpoint URL"*|*"Connect timeout"*|*"Read timeout"*|*"Connection was closed"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# Error text of the last failed listing. Kept in a file so that warnings on
+# stderr never mix with the list itself.
+ERR_FILE=$(mktemp) || fail "Could not create a temporary file."
+trap 'rm -f "$ERR_FILE"' EXIT
+LIST_ERROR=""
+
 # Sets HAVE (instances this request holds) and PENDING (reservations still in
 # the pending state). Not a $(...) function, because it updates CREATED.
-# Returns 1, and changes nothing, if AWS cannot list the reservations. An empty
-# list must never stand in for a failed call: the script would count 0 and
-# book the whole request again.
+# Returns 1, sets LIST_ERROR and changes nothing else if AWS cannot list the
+# reservations. An empty list must never stand in for a failed call: the
+# script would count 0 and book the whole request again.
 count_held() {
   local listed id c state entry keep=()
-  listed=$(aws ec2 describe-capacity-reservations --filters "${NAME_FILTERS[@]}" \
-    --query 'CapacityReservations[].[CapacityReservationId,TotalInstanceCount,State]' --output text) || return 1
+  if ! listed=$(aws ec2 describe-capacity-reservations --filters "${NAME_FILTERS[@]}" \
+    --query 'CapacityReservations[].[CapacityReservationId,TotalInstanceCount,State]' --output text 2>"$ERR_FILE"); then
+    LIST_ERROR=$(cat "$ERR_FILE"); return 1
+  fi
   HAVE=0; PENDING=0
   while read -r id c state; do
     [[ -n "$id" ]] || continue
@@ -188,17 +208,16 @@ reserve() {
   if [[ "$out" == *InsufficientInstanceCapacity* ]]; then
     echo "$(date '+%H:%M:%S') no capacity for $1"; return 1
   fi
-  case "$out" in
-    *RequestLimitExceeded*|*Throttling*|*InternalError*|*ServiceUnavailable*|*"(Unavailable)"*|\
-    *"Could not connect to the endpoint URL"*|*"Connect timeout"*|*"Read timeout"*|*"Connection was closed"*)
-      RETRY_TOKEN="$token"; RETRY_TOKEN_COUNT="$1"
-      echo "$(date '+%H:%M:%S') temporary AWS error, will try again: ${out%%$'\n'*}"; return 2 ;;
-  esac
+  if is_temporary "$out"; then
+    RETRY_TOKEN="$token"; RETRY_TOKEN_COUNT="$1"
+    echo "$(date '+%H:%M:%S') temporary AWS error, will try again: ${out%%$'\n'*}"; return 2
+  fi
   fail "AWS returned an error that retrying will not fix:
 $out"
 }
 
-count_held || fail "Could not list the reservations of '$NAME' in $AWS_REGION."
+count_held || fail "Could not list the reservations of '$NAME' in $AWS_REGION:
+$LIST_ERROR"
 echo "Request '$NAME': $COUNT x $INSTANCE_TYPE in $ZONE_LABEL (account $ACCOUNT_ID). Already holding $HAVE."
 if (( HAVE > COUNT )); then
   echo "It already holds more than COUNT. The script never cancels on its own; use --cancel to remove reservations."
@@ -207,8 +226,12 @@ fi
 DEADLINE=$(( $(date +%s) + MAX_HOURS * 3600 ))
 while true; do
   if ! count_held; then
-    # Never guess what the request holds. Wait and count again.
-    echo "$(date '+%H:%M:%S') could not list the request's reservations, will try again"
+    # Never guess what the request holds. Wait and count again, but only if
+    # the error can clear on its own. Expired credentials do not.
+    is_temporary "$LIST_ERROR" || fail "Could not list the reservations of '$NAME'. Retrying will not fix this:
+$LIST_ERROR
+What the request holds stays reserved. Fix the error and run the script again with the same NAME."
+    echo "$(date '+%H:%M:%S') could not list the request's reservations, will try again: ${LIST_ERROR%%$'\n'*}"
   else
     NEED=$(( COUNT - HAVE ))
     if (( NEED <= 0 )); then
@@ -219,12 +242,18 @@ while true; do
       sleep 10; continue
     fi
     echo "Holding $HAVE of $COUNT"
+    # After a temporary error, first repeat that call with its client token.
+    # If it did succeed, AWS returns the same reservation and nothing extra is
+    # booked. This also covers a "try for 1" that ended in a temporary error.
+    if [[ -n "$RETRY_TOKEN" ]] && (( RETRY_TOKEN_COUNT <= NEED )); then
+      TRY=$RETRY_TOKEN_COUNT
+    else
+      TRY=$NEED; RETRY_TOKEN=""
+    fi
     # Try for everything still needed; if there is no capacity, try for one.
-    # After a temporary error, skip the try for one: the next round repeats
-    # the same call with the same client token.
-    reserve "$NEED"; RC=$?
+    reserve "$TRY"; RC=$?
     (( RC == 0 )) && continue
-    if (( RC == 1 && NEED > 1 )); then
+    if (( RC == 1 && TRY > 1 )); then
       reserve 1 && continue
     fi
   fi

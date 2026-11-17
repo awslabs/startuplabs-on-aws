@@ -40,10 +40,12 @@ flowchart TB
     wait["Wait RETRY_SECONDS"]
     timeout{"MAX_HOURS reached?"}
     finish([Print reservations and next steps])
+    stop([Stop with the AWS error])
 
     start --> count
     count -->|listed| done
-    count -->|list failed| timeout
+    count -->|temporary error| timeout
+    count -->|other error| stop
     done -->|yes| pending
     pending -->|no| finish
     pending -->|yes| waitPending --> count
@@ -51,18 +53,23 @@ flowchart TB
     tryAll -->|reserved| count
     tryAll -->|no capacity| tryOne
     tryAll -->|temporary error| timeout
+    tryAll -->|other error| stop
     tryOne -->|reserved| count
     tryOne -->|no capacity or temporary error| timeout
     timeout -->|no| wait --> count
     timeout -->|yes| finish
 ```
 
-If AWS cannot list the reservations, the script does not guess. It waits and
-counts again, so that a failed call cannot make it book the request a second
-time. After a temporary error from AWS on create, such as throttling or a lost
-connection, it tries again in the next round with the same client token. If the
-first call did succeed, AWS then returns that reservation instead of creating a
-new one.
+If AWS cannot list the reservations because of a temporary error, such as
+throttling or a lost connection, the script does not guess. It waits and counts
+again, so that a failed call cannot make it book the request a second time. If
+the listing fails for any other reason, such as expired credentials or a
+permissions error, it stops with the AWS error. What the request holds stays
+reserved, and you can run the script again with the same `NAME`.
+
+After a temporary error on create, the next round first repeats that call, with
+the same count and client token. If the first call did succeed, AWS returns
+that reservation instead of creating a new one.
 
 ## Partial results and running it again
 
@@ -253,9 +260,9 @@ because these actions do not support resource-level permissions
   already have configured.
 - Before it creates anything, it checks that the credentials belong to
   `ACCOUNT_ID`, so that it cannot reserve capacity in the wrong account.
-- It stops on an AWS error that retrying will not fix, such as a quota or
-  permissions error. It retries "no capacity", throttling, AWS internal errors
-  and lost connections.
+- It stops on an AWS error that retrying will not fix, such as expired
+  credentials, a quota error or a permissions error. It retries "no capacity",
+  throttling, AWS internal errors and lost connections.
 
 ## Cost
 
@@ -322,13 +329,15 @@ because no g7e.48xlarge capacity was available during testing:
 | Real run with `t3.micro` in `use1-az2` after adding the client token | Reserved 2 in one request; running again booked nothing; `--cancel` removed them |
 | Stand-in AWS CLI where one `DescribeCapacityReservations` call fails after the request holds 2 of 3 | It waited and counted again, and the request ended with exactly 3 |
 | Stand-in AWS CLI where `CreateCapacityReservation` loses the connection after AWS created the reservation | It tried again with the same client token, got the same reservation back, and the request ended with 2 of 2 |
+| Stand-in AWS CLI where the "try for 1" call loses the connection after AWS created the reservation, and AWS lists it late | It repeated the call for 1 with the same token, then reserved the other 2, and the request ended with exactly 3 |
+| Stand-in AWS CLI where credentials expire between rounds | It stopped at the next listing with the `ExpiredToken` error and exit code 1. A permissions error on listing stopped it the same way |
 | Stand-in AWS CLI where one of two cancels fails | It cancelled the other, said which one failed, and exited with an error |
 | An unknown argument, such as `--cancle` | It stopped before calling AWS |
-| IAM policy above, with `*` for the Region and account | The IAM policy simulator allowed every action the script calls, and denied tagging after creation and cancelling untagged reservations |
+| Real run with `t3.micro` in `usw2-az1`, zone given as a zone ID | Reserved 2; running again booked nothing; raising `COUNT` to 3 booked 1 more; the same `NAME` with `t3.small` stopped; an instance type not offered and a wrong `ACCOUNT_ID` stopped with exit code 1; `--cancel` removed all 3, and a second `--cancel` found nothing |
+| IAM policy above, with a real Region and account filled in | The IAM policy simulator allowed every action the script calls in that Region, denied them in another Region, and denied tagging after creation and cancelling untagged reservations |
 
 Not tested: a successful g7e.48xlarge reservation, a live run under the IAM
-policy as its own role, the policy with the Region and account filled in, and
-two copies running at the same time.
+policy as its own role, and two copies running at the same time.
 
 ## License
 
