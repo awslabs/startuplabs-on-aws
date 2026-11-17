@@ -1,4 +1,4 @@
-# Reserve scarce GPU capacity with On-Demand Capacity Reservations
+# Reserve scarce EC2 capacity with On-Demand Capacity Reservations
 
 When an instance type such as a large GPU instance has no capacity, a request
 that fails now can still succeed a few minutes or hours later. This Bash script
@@ -6,6 +6,12 @@ keeps trying to create
 [On-Demand Capacity Reservations](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-reservations.html)
 (ODCRs) until it holds the number of instances you asked for, and it keeps
 whatever it gets along the way.
+
+The script works with any instance type. It suits On-Demand instance types
+that run short of capacity, such as G6e or G7e. For P5, P6 and Trainium
+instances, use
+[Capacity Blocks for ML](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-blocks.html)
+instead: you reserve them for a set period, up to eight weeks ahead.
 
 > This is sample code for demonstration and learning. It is **not
 > production-ready** and must be reviewed, tested, and hardened for your own
