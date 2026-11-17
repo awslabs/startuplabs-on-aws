@@ -33,22 +33,36 @@ flowchart TB
     start([Run reserve-capacity.sh])
     count["Count reservations tagged with NAME<br/>DescribeCapacityReservations"]
     done{"Holding COUNT?"}
+    pending{"Any still pending?"}
+    waitPending["Wait 10 seconds"]
     tryAll["Try for all that are still needed<br/>CreateCapacityReservation"]
     tryOne["Try for 1<br/>CreateCapacityReservation"]
     wait["Wait RETRY_SECONDS"]
     timeout{"MAX_HOURS reached?"}
     finish([Print reservations and next steps])
 
-    start --> count --> done
-    done -->|yes| finish
+    start --> count
+    count -->|listed| done
+    count -->|list failed| timeout
+    done -->|yes| pending
+    pending -->|no| finish
+    pending -->|yes| waitPending --> count
     done -->|no| tryAll
     tryAll -->|reserved| count
     tryAll -->|no capacity| tryOne
+    tryAll -->|temporary error| timeout
     tryOne -->|reserved| count
-    tryOne -->|no capacity| timeout
+    tryOne -->|no capacity or temporary error| timeout
     timeout -->|no| wait --> count
     timeout -->|yes| finish
 ```
+
+If AWS cannot list the reservations, the script does not guess. It waits and
+counts again, so that a failed call cannot make it book the request a second
+time. After a temporary error from AWS on create, such as throttling or a lost
+connection, it tries again in the next round with the same client token. If the
+first call did succeed, AWS then returns that reservation instead of creating a
+new one.
 
 ## Partial results and running it again
 
@@ -185,7 +199,10 @@ aws ec2 describe-availability-zones --region us-east-1 \
 ## IAM permissions
 
 The script calls only the actions below. Cancelling is limited to reservations
-that carry the script's `reserve-capacity-request` tag.
+that carry the script's `reserve-capacity-request` tag. Replace `<REGION>` and
+`<ACCOUNT_ID>` with your values. The `ReadOnly` statement uses `"Resource": "*"`
+because these actions do not support resource-level permissions
+([Actions, resources, and condition keys for Amazon EC2](https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonec2.html)).
 
 ```json
 {
@@ -206,13 +223,13 @@ that carry the script's `reserve-capacity-request` tag.
       "Sid": "CreateTaggedReservations",
       "Effect": "Allow",
       "Action": "ec2:CreateCapacityReservation",
-      "Resource": "arn:aws:ec2:*:*:capacity-reservation/*"
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:capacity-reservation/*"
     },
     {
       "Sid": "TagOnCreateOnly",
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
-      "Resource": "arn:aws:ec2:*:*:capacity-reservation/*",
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:capacity-reservation/*",
       "Condition": {
         "StringEquals": { "ec2:CreateAction": "CreateCapacityReservation" }
       }
@@ -221,7 +238,7 @@ that carry the script's `reserve-capacity-request` tag.
       "Sid": "CancelOnlyScriptReservations",
       "Effect": "Allow",
       "Action": "ec2:CancelCapacityReservation",
-      "Resource": "arn:aws:ec2:*:*:capacity-reservation/*",
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:capacity-reservation/*",
       "Condition": {
         "Null": { "aws:ResourceTag/reserve-capacity-request": "false" }
       }
@@ -236,8 +253,9 @@ that carry the script's `reserve-capacity-request` tag.
   already have configured.
 - Before it creates anything, it checks that the credentials belong to
   `ACCOUNT_ID`, so that it cannot reserve capacity in the wrong account.
-- It stops on any AWS error other than "no capacity", such as a quota or
-  permissions error, because retrying would not fix it.
+- It stops on an AWS error that retrying will not fix, such as a quota or
+  permissions error. It retries "no capacity", throttling, AWS internal errors
+  and lost connections.
 
 ## Cost
 
@@ -261,8 +279,12 @@ for your instance type and Region.
 To cancel every reservation of a request, run:
 
 ```bash
-ACCOUNT_ID=111122223333 NAME=team-a-training ./reserve-capacity.sh --cancel
+ACCOUNT_ID=111122223333 AWS_REGION=us-east-1 NAME=team-a-training ./reserve-capacity.sh --cancel
 ```
+
+`--cancel` looks only in `AWS_REGION`, so use the Region you reserved in. If a
+reservation cannot be cancelled, the script says so and exits with an error;
+run `--cancel` again.
 
 Instances that keep running after you cancel are billed at the normal
 On-Demand rate.
@@ -298,10 +320,15 @@ because no g7e.48xlarge capacity was available during testing:
 | Bash 3.2, the version macOS ships, with a stand-in AWS CLI | Settings checks, the retry loop, the zone check and `--cancel` behaved the same as on Bash 5 |
 | Stand-in AWS CLI that hides new reservations from `DescribeCapacityReservations` for a few seconds | Asking for 3 at once made exactly 1 request; asking 1 at a time made exactly 3; a new reservation that failed was replaced, and the request ended with 3 |
 | Real run with `t3.micro` in `use1-az2` after adding the client token | Reserved 2 in one request; running again booked nothing; `--cancel` removed them |
-| IAM policy above | The IAM policy simulator allowed every action the script calls, and denied tagging after creation and cancelling untagged reservations |
+| Stand-in AWS CLI where one `DescribeCapacityReservations` call fails after the request holds 2 of 3 | It waited and counted again, and the request ended with exactly 3 |
+| Stand-in AWS CLI where `CreateCapacityReservation` loses the connection after AWS created the reservation | It tried again with the same client token, got the same reservation back, and the request ended with 2 of 2 |
+| Stand-in AWS CLI where one of two cancels fails | It cancelled the other, said which one failed, and exited with an error |
+| An unknown argument, such as `--cancle` | It stopped before calling AWS |
+| IAM policy above, with `*` for the Region and account | The IAM policy simulator allowed every action the script calls, and denied tagging after creation and cancelling untagged reservations |
 
 Not tested: a successful g7e.48xlarge reservation, a live run under the IAM
-policy as its own role, and two copies running at the same time.
+policy as its own role, the policy with the Region and account filled in, and
+two copies running at the same time.
 
 ## License
 

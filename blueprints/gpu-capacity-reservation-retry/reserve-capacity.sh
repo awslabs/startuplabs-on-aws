@@ -37,10 +37,17 @@ MAX_HOURS="${MAX_HOURS:-8}"                # Stop after this long. Raise it for 
 set -uo pipefail
 [[ "${DEBUG:-0}" == "1" ]] && set -x
 TAG_KEY="reserve-capacity-request"
-MODE="reserve"
-[[ "${1:-}" == "--cancel" ]] && MODE="cancel"
 
 fail() { echo "ERROR: $*"; exit 1; }
+
+# Any argument other than --cancel stops the script, so that a typo such as
+# --cancle cannot start a reservation run.
+(( $# <= 1 )) || fail "Too many arguments. Use no argument to reserve, or --cancel to cancel."
+case "${1:-}" in
+  "")       MODE="reserve" ;;
+  --cancel) MODE="cancel" ;;
+  *)        fail "Unknown argument '$1'. Use no argument to reserve, or --cancel to cancel." ;;
+esac
 
 # ---- Check settings ----
 [[ -n "$ACCOUNT_ID" ]] || fail "Set ACCOUNT_ID at the top of the script."
@@ -50,7 +57,7 @@ fail() { echo "ERROR: $*"; exit 1; }
 export AWS_REGION
 if [[ "$MODE" == "reserve" ]]; then
   [[ "$ZONE" =~ ^[a-z0-9-]+$ ]] || fail "Set ZONE, e.g. ZONE=us-east-1b or ZONE=use1-az2."
-  [[ -n "$INSTANCE_TYPE" ]]     || fail "Set INSTANCE_TYPE, e.g. INSTANCE_TYPE=g7e.48xlarge."
+  [[ "$INSTANCE_TYPE" =~ ^[a-z0-9-]+\.[a-z0-9]+$ ]] || fail "Set INSTANCE_TYPE, e.g. INSTANCE_TYPE=g7e.48xlarge."
   [[ "$COUNT" =~ ^[1-9][0-9]*$ ]] || fail "Set COUNT to the number of instances you want, e.g. COUNT=3."
   [[ "$RETRY_SECONDS" =~ ^[0-9]+$ ]] || fail "RETRY_SECONDS must be a whole number of seconds."
   [[ "$MAX_HOURS" =~ ^[0-9]+$ ]]     || fail "MAX_HOURS must be a whole number of hours."
@@ -72,27 +79,33 @@ request_reservations() {
 
 # ---- --cancel: cancel every reservation of this request ----
 if [[ "$MODE" == "cancel" ]]; then
-  LIST=$(request_reservations)
+  LIST=$(request_reservations) || fail "Could not list the reservations of '$NAME' in $AWS_REGION. Nothing was cancelled."
   [[ -n "$LIST" ]] || { echo "Request '$NAME' has no active reservations in $AWS_REGION. Nothing to cancel."; exit 0; }
+  FAILED=0
   while read -r zone zid itype id n; do
-    if aws ec2 cancel-capacity-reservation --capacity-reservation-id "$id" --output text >/dev/null; then
+    # </dev/null: the AWS CLI must not read the rest of the list from stdin.
+    if aws ec2 cancel-capacity-reservation --capacity-reservation-id "$id" --output text >/dev/null </dev/null; then
       echo "cancelled $id ($n x $itype in $zone ($zid))"
     else
-      echo "could not cancel $id"
+      echo "could not cancel $id"; FAILED=$(( FAILED + 1 ))
     fi
   done <<<"$LIST"
+  (( FAILED == 0 )) || fail "$FAILED reservation(s) were not cancelled and are still billed. Run --cancel again."
   exit 0
 fi
 
 # ---- Resolve ZONE: zone names differ per account, zone IDs do not ----
-read -r ZONE_NAME ZONE_ID < <(aws ec2 describe-availability-zones \
-  --query "AvailabilityZones[?ZoneName=='$ZONE' || ZoneId=='$ZONE'] | [0].[ZoneName,ZoneId]" --output text)
+ZONES=$(aws ec2 describe-availability-zones \
+  --query "AvailabilityZones[?ZoneName=='$ZONE' || ZoneId=='$ZONE'] | [0].[ZoneName,ZoneId]" --output text) \
+  || fail "Could not list the Availability Zones in $AWS_REGION."
+read -r ZONE_NAME ZONE_ID <<<"$ZONES"
 [[ -n "${ZONE_ID:-}" && "$ZONE_ID" != "None" ]] \
   || fail "$ZONE is not a zone name or zone ID in $AWS_REGION for this account."
 ZONE_LABEL="$ZONE_NAME ($ZONE_ID)"
 
 # ---- Stop if this request already has reservations somewhere else ----
-OTHER=$(request_reservations | awk -v z="$ZONE_NAME" -v t="$INSTANCE_TYPE" '$1 != z || $3 != t')
+ALL=$(request_reservations) || fail "Could not list the reservations of '$NAME' in $AWS_REGION."
+OTHER=$(awk -v z="$ZONE_NAME" -v t="$INSTANCE_TYPE" 'NF && ($1 != z || $3 != t)' <<<"$ALL")
 if [[ -n "$OTHER" ]]; then
   echo "ERROR: request '$NAME' already has reservations for a different zone or instance type:"
   echo "$OTHER" | awk '{print "  " $4 ": " $5 " x " $3 " in " $1 " (" $2 ")"}'
@@ -116,11 +129,14 @@ CREATED=()
 
 # Sets HAVE (instances this request holds) and PENDING (reservations still in
 # the pending state). Not a $(...) function, because it updates CREATED.
+# Returns 1, and changes nothing, if AWS cannot list the reservations. An empty
+# list must never stand in for a failed call: the script would count 0 and
+# book the whole request again.
 count_held() {
   local listed id c state entry keep=()
-  HAVE=0; PENDING=0
   listed=$(aws ec2 describe-capacity-reservations --filters "${NAME_FILTERS[@]}" \
-    --query 'CapacityReservations[].[CapacityReservationId,TotalInstanceCount,State]' --output text) || listed=""
+    --query 'CapacityReservations[].[CapacityReservationId,TotalInstanceCount,State]' --output text) || return 1
+  HAVE=0; PENDING=0
   while read -r id c state; do
     [[ -n "$id" ]] || continue
     HAVE=$(( HAVE + c ))
@@ -140,12 +156,24 @@ count_held() {
   CREATED=(${keep[@]+"${keep[@]}"})
 }
 
-# Try to reserve $1 instances. Returns 0 on success, 1 on no capacity, exits on any other error.
+# Client token of a create call that ended in a temporary error, and its count.
+# That call may have succeeded on the AWS side. The next try for the same count
+# sends the same token, so AWS returns that reservation instead of a new one.
+RETRY_TOKEN=""; RETRY_TOKEN_COUNT=""
+
+# Try to reserve $1 instances. Returns 0 on success, 1 on no capacity,
+# 2 on a temporary error (throttling, network, AWS internal error).
+# Exits on any other error, such as quota or permissions.
 reserve() {
   local out token
   # Same token on the AWS CLI's own retries, so a request that timed out but
   # succeeded is not created twice. Max 64 characters.
-  token="${NAME:0:40}-$(date +%s)-$RANDOM"
+  if [[ -n "$RETRY_TOKEN" && "$RETRY_TOKEN_COUNT" == "$1" ]]; then
+    token="$RETRY_TOKEN"
+  else
+    token="${NAME:0:40}-$(date +%s)-$RANDOM"
+  fi
+  RETRY_TOKEN=""
   out=$(aws ec2 create-capacity-reservation \
     --availability-zone "$ZONE_NAME" --instance-type "$INSTANCE_TYPE" \
     --instance-platform Linux/UNIX --instance-count "$1" \
@@ -160,11 +188,17 @@ reserve() {
   if [[ "$out" == *InsufficientInstanceCapacity* ]]; then
     echo "$(date '+%H:%M:%S') no capacity for $1"; return 1
   fi
+  case "$out" in
+    *RequestLimitExceeded*|*Throttling*|*InternalError*|*ServiceUnavailable*|*"(Unavailable)"*|\
+    *"Could not connect to the endpoint URL"*|*"Connect timeout"*|*"Read timeout"*|*"Connection was closed"*)
+      RETRY_TOKEN="$token"; RETRY_TOKEN_COUNT="$1"
+      echo "$(date '+%H:%M:%S') temporary AWS error, will try again: ${out%%$'\n'*}"; return 2 ;;
+  esac
   fail "AWS returned an error that retrying will not fix:
 $out"
 }
 
-count_held
+count_held || fail "Could not list the reservations of '$NAME' in $AWS_REGION."
 echo "Request '$NAME': $COUNT x $INSTANCE_TYPE in $ZONE_LABEL (account $ACCOUNT_ID). Already holding $HAVE."
 if (( HAVE > COUNT )); then
   echo "It already holds more than COUNT. The script never cancels on its own; use --cancel to remove reservations."
@@ -172,27 +206,39 @@ fi
 
 DEADLINE=$(( $(date +%s) + MAX_HOURS * 3600 ))
 while true; do
-  count_held
-  NEED=$(( COUNT - HAVE ))
-  if (( NEED <= 0 )); then
-    # A pending reservation can still fail, so wait until none are pending.
-    (( PENDING == 0 )) && break
-    (( $(date +%s) >= DEADLINE )) && { echo "Reached MAX_HOURS with $PENDING reservation(s) still pending."; break; }
-    echo "$(date '+%H:%M:%S') waiting for $PENDING new reservation(s) to become active"
-    sleep 10; continue
+  if ! count_held; then
+    # Never guess what the request holds. Wait and count again.
+    echo "$(date '+%H:%M:%S') could not list the request's reservations, will try again"
+  else
+    NEED=$(( COUNT - HAVE ))
+    if (( NEED <= 0 )); then
+      # A pending reservation can still fail, so wait until none are pending.
+      (( PENDING == 0 )) && break
+      (( $(date +%s) >= DEADLINE )) && { echo "Reached MAX_HOURS with $PENDING reservation(s) still pending."; break; }
+      echo "$(date '+%H:%M:%S') waiting for $PENDING new reservation(s) to become active"
+      sleep 10; continue
+    fi
+    echo "Holding $HAVE of $COUNT"
+    # Try for everything still needed; if there is no capacity, try for one.
+    # After a temporary error, skip the try for one: the next round repeats
+    # the same call with the same client token.
+    reserve "$NEED"; RC=$?
+    (( RC == 0 )) && continue
+    if (( RC == 1 && NEED > 1 )); then
+      reserve 1 && continue
+    fi
   fi
-  echo "Holding $HAVE of $COUNT"
-  # Try for everything still needed; if that fails, try for one.
-  reserve "$NEED" && continue
-  (( NEED > 1 )) && reserve 1 && continue
   (( $(date +%s) >= DEADLINE )) && { echo "Reached MAX_HOURS ($MAX_HOURS). What it holds stays reserved."; break; }
   sleep "$RETRY_SECONDS"
 done
 
-count_held
 echo
-echo "Request '$NAME' holds $HAVE of $COUNT x $INSTANCE_TYPE in $ZONE_LABEL:"
-request_reservations | awk '{print "  " $4 ": " $5}'
+if count_held && LIST=$(request_reservations); then
+  echo "Request '$NAME' holds $HAVE of $COUNT x $INSTANCE_TYPE in $ZONE_LABEL:"
+  awk 'NF {print "  " $4 ": " $5}' <<<"$LIST"
+else
+  echo "Could not list the reservations of '$NAME'. Check them with the command in the README."
+fi
 echo
 echo "Next: start your instances in $ZONE_LABEL. Matching instances there use these reservations automatically."
 echo "To stop billing: ACCOUNT_ID=$ACCOUNT_ID AWS_REGION=$AWS_REGION NAME=$NAME ./reserve-capacity.sh --cancel"
