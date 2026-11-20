@@ -1,0 +1,11 @@
+{
+  "app": "uv run --group infra python -m infra.app",
+  "watch": { "include": ["infra/**", "src/**"] },
+  "context": {
+    "project": "sup",
+    "stage": "dev",
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:defaultCrossStackReferences": "strong",
+    "@aws-cdk/aws-iam:minimizePolicies": true
+  }
+}

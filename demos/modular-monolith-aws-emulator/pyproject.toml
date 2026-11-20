@@ -1,0 +1,126 @@
+[project]
+name = "modular-monolith-aws-emulator"
+dynamic = ["version"]
+description = "Modular monolith boilerplate: strangler fig, ports/adapters, facades, AWS Emulator"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "boto3>=1.40",
+  "pydantic>=2.8",
+  "pydantic-settings>=2.4",
+  "email-validator>=2.2",
+  "httpx>=0.27",
+  "pyjwt[crypto]>=2.9",
+  "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "import-linter>=2.1",
+  "types-pyyaml",
+]
+infra = [
+    "aws-cdk-lib>=2.270,<2.276",
+    "cdk-nag>=2.35",
+    "constructs>=10",
+    "rich>=13",
+]
+
+[project.scripts]
+app = "app.main:run"
+app-bootstrap = "app.bootstrap:main"
+app-explain = "app.explain:main"
+
+[project.optional-dependencies]
+aws = [
+    "mangum>=0.19",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/app/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S608"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["app"]
+
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+# aws-cdk-lib ships ~270 MB of jsii-generated typed Python. Following it costs
+# ~2.4 GB RSS and hangs small CI runners; treat the CDK packages as Any instead.
+[[tool.mypy.overrides]]
+module = ["aws_cdk", "aws_cdk.*", "constructs", "constructs.*", "cdk_nag", "cdk_nag.*", "jsii", "jsii.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+# CDK stacks subclass Stack, which is Any once the CDK is skipped.
+[[tool.mypy.overrides]]
+module = ["infra.*"]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = ["integration: needs a running AWS Emulator (just emulator-up)"]
+addopts = "-ra --strict-markers"
+
+[tool.importlinter]
+root_package = "app"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Modules are independent: they talk through contracts and events only"
+type = "independence"
+modules = ["app.modules.identity", "app.modules.profiles", "app.modules.jobs"]
+ignore_imports = [
+  "app.modules.profiles.** -> app.modules.identity.contract",
+  "app.modules.jobs.** -> app.modules.identity.contract",
+]
+
+[[tool.importlinter.contracts]]
+name = "Modules never touch adapters, only facades and ports"
+type = "forbidden"
+source_modules = ["app.modules"]
+forbidden_modules = ["app.platform.adapters", "boto3", "botocore"]
+
+[[tool.importlinter.contracts]]
+name = "Platform does not know the business modules"
+type = "forbidden"
+source_modules = ["app.platform", "app.repository", "app.shared", "app.strangler"]
+forbidden_modules = ["app.modules"]
+
+[[tool.importlinter.contracts]]
+name = "Facades depend on ports, never on concrete adapters"
+type = "forbidden"
+source_modules = ["app.platform.facades", "app.platform.ports"]
+forbidden_modules = ["app.platform.adapters", "boto3", "botocore"]

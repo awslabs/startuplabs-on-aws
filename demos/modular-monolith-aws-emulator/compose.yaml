@@ -1,0 +1,27 @@
+# Local AWS: one emulator process serving every AWS API on https://127.0.0.1:9297.
+# Fixed project name: every checkout or worktree shares the same emulator
+# instead of colliding on the container name.
+name: aws-emulator-sup
+services:
+  aws-emulator:
+    build:
+      context: ./emulator
+      args:
+        EMULATOR_ARCH: ${EMULATOR_ARCH:-x86_64}
+    image: aws-emulator:local
+    container_name: aws-emulator-sup
+    command: ["-p", "${EMULATOR_PORT:-9297}"]
+    user: "${EMULATOR_UID:-1000}:${EMULATOR_GID:-1000}"
+    environment:
+      # Same paths inside and outside the container, so the generated
+      # ~/.aws/emulator/<port>/{config,ca.pem,emulator_credentials} are valid on the host.
+      HOME: ${HOME}
+      EMULATOR_TELEMETRY: ${EMULATOR_TELEMETRY:-on}
+      EMULATOR_PORT: ${EMULATOR_PORT:-9297}
+    ports:
+      # Loopback only. `9297:9297` would expose the emulator to the whole network.
+      - "127.0.0.1:${EMULATOR_PORT:-9297}:${EMULATOR_PORT:-9297}"
+    volumes:
+      - ${HOME}/.aws/emulator:${HOME}/.aws/emulator
+    mem_limit: 2g
+    memswap_limit: 2g

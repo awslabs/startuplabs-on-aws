@@ -1,0 +1,527 @@
+diff --git a/infra/stacks/api.py b/infra/stacks/api.py
+index f3ed5d8..c664bc0 100644
+--- a/infra/stacks/api.py
++++ b/infra/stacks/api.py
+@@ -112 +112,4 @@ class ApiStack(Stack):
+-                resources=[platform.assets.arn_for_objects("avatars/*")],
++                resources=[
++                    platform.assets.arn_for_objects("avatars/*"),
++                    platform.assets.arn_for_objects("receipts/*"),
++                ],
+@@ -271,0 +275,2 @@ class ApiStack(Stack):
++                f"AwsSolutions::AwsSolutions-IAM5[Resource::{self._export('AssetsBucket')}"
++                "/receipts/*]": "Object keys under the receipts/ prefix only (orders module).",
+diff --git a/pyproject.toml b/pyproject.toml
+index 3ee9de0..486beca 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -104 +104 @@ type = "independence"
+-modules = ["app.modules.identity", "app.modules.profiles", "app.modules.jobs"]
++modules = ["app.modules.identity", "app.modules.profiles", "app.modules.jobs", "app.modules.orders"]
+@@ -107,0 +108 @@ ignore_imports = [
++  "app.modules.orders.** -> app.modules.identity.contract",
+diff --git a/src/app/modules/__init__.py b/src/app/modules/__init__.py
+index 8c30dfd..cd519ba 100644
+--- a/src/app/modules/__init__.py
++++ b/src/app/modules/__init__.py
+@@ -12 +12 @@ append `<name>` to INSTALLED.
+-INSTALLED = ("identity", "profiles", "jobs")
++INSTALLED = ("identity", "profiles", "jobs", "orders")
+diff --git a/src/app/modules/orders/__init__.py b/src/app/modules/orders/__init__.py
+new file mode 100644
+index 0000000..0458e74
+--- /dev/null
++++ b/src/app/modules/orders/__init__.py
+@@ -0,0 +1 @@
++"""orders module: buy_product (see docs/guides/buy-product.md)."""
+diff --git a/src/app/modules/orders/api.py b/src/app/modules/orders/api.py
+new file mode 100644
+index 0000000..cdca494
+--- /dev/null
++++ b/src/app/modules/orders/api.py
+@@ -0,0 +1,70 @@
++from __future__ import annotations
++
++from datetime import datetime
++
++from fastapi import APIRouter, status
++from pydantic import BaseModel, Field
++
++from app.modules.identity.contract import CurrentPrincipal
++from app.modules.orders.application import OrderService
++from app.modules.orders.domain import MAX_QUANTITY, Order, Product
++
++
++class BuyProductIn(BaseModel):
++    product_id: str = Field(min_length=1, max_length=64)
++    quantity: int = Field(ge=1, le=MAX_QUANTITY)
++
++
++class ProductOut(BaseModel):
++    id: str
++    name: str
++    price_cents: int
++    stock: int
++
++    @classmethod
++    def of(cls, p: Product) -> ProductOut:
++        return cls(id=p.id, name=p.name, price_cents=p.price_cents, stock=p.stock)
++
++
++class OrderOut(BaseModel):
++    id: str
++    product_id: str
++    quantity: int
++    total_cents: int
++    created_at: datetime
++
++    @classmethod
++    def of(cls, o: Order) -> OrderOut:
++        return cls(
++            id=o.id,
++            product_id=o.product_id,
++            quantity=o.quantity,
++            total_cents=o.total_cents,
++            created_at=o.created_at,
++        )
++
++
++class UrlOut(BaseModel):
++    url: str
++
++
++def build_router(service: OrderService) -> APIRouter:
++    router = APIRouter(tags=["orders"])
++
++    @router.get("/api/v1/orders/products")
++    def catalog(_principal: CurrentPrincipal) -> list[ProductOut]:
++        return [ProductOut.of(p) for p in service.catalog()]
++
++    @router.post("/api/v1/orders/purchases", status_code=status.HTTP_201_CREATED)
++    def buy_product(principal: CurrentPrincipal, body: BuyProductIn) -> OrderOut:
++        return OrderOut.of(service.buy_product(principal, body.product_id, body.quantity))
++
++    @router.get("/api/v1/orders/purchases")
++    def my_orders(principal: CurrentPrincipal) -> list[OrderOut]:
++        return [OrderOut.of(o) for o in service.my_orders(principal)]
++
++    @router.get("/api/v1/orders/purchases/{order_id}/receipt")
++    def receipt(principal: CurrentPrincipal, order_id: str) -> UrlOut:
++        return UrlOut(url=service.receipt_url(principal, order_id))
++
++    return router
+diff --git a/src/app/modules/orders/application.py b/src/app/modules/orders/application.py
+new file mode 100644
+index 0000000..7a7b68f
+--- /dev/null
++++ b/src/app/modules/orders/application.py
+@@ -0,0 +1,69 @@
++"""buy_product and friends. Orchestrates repositories, storage and events; no HTTP, no boto3."""
++
++from __future__ import annotations
++
++import json
++import logging
++
++from app.modules.orders.contract import ProductPurchased
++from app.modules.orders.domain import Order, Product
++from app.modules.orders.infrastructure import OrderRepository, ProductRepository
++from app.platform.facades import StorageFacade
++from app.platform.ports.database import SqlDatabase
++from app.shared import errors
++from app.shared.events import EventBus
++from app.shared.principal import Principal
++
++log = logging.getLogger(__name__)
++
++
++class OrderService:
++    def __init__(self, db: SqlDatabase, storage: StorageFacade, events: EventBus) -> None:
++        self._db = db
++        self._storage = storage
++        self._events = events
++
++    def catalog(self) -> list[Product]:
++        return ProductRepository(self._db).list()
++
++    def buy_product(self, principal: Principal, product_id: str, quantity: int) -> Order:
++        # One transaction: stock decrement and order row commit or roll back together.
++        with self._db.transaction() as tx:
++            products, orders = ProductRepository(tx), OrderRepository(tx)
++            product = products.get(product_id)
++            if product is None:
++                raise errors.NotFound(f"product {product_id}")
++            order = Order.place(principal.subject, product, quantity)  # validates quantity
++            if products.take_stock(product_id, quantity) is None:
++                raise errors.Conflict("insufficient stock")
++            orders.add(order)
++        # After commit: side effects that must not happen for a rolled-back order.
++        self._storage.save(
++            f"receipts/{principal.subject}/{order.id}.json",
++            json.dumps(
++                {
++                    "order_id": order.id,
++                    "product": product.name,
++                    "quantity": order.quantity,
++                    "total_cents": order.total_cents,
++                    "created_at": order.created_at.isoformat(),
++                }
++            ).encode(),
++            "application/json",
++        )
++        self._events.publish(
++            ProductPurchased(
++                order.id, order.user_id, order.product_id, order.quantity, order.total_cents
++            )
++        )
++        log.info("product purchased", extra={"order_id": order.id})
++        return order
++
++    def my_orders(self, principal: Principal) -> list[Order]:
++        return OrderRepository(self._db).for_user(principal.subject)
++
++    def receipt_url(self, principal: Principal, order_id: str) -> str:
++        key = f"receipts/{principal.subject}/{order_id}.json"
++        if self._storage.load(key) is None:  # also hides other users' receipts
++            raise errors.NotFound(f"order {order_id}")
++        return self._storage.download_url(key)
+diff --git a/src/app/modules/orders/contract.py b/src/app/modules/orders/contract.py
+new file mode 100644
+index 0000000..3e94f46
+--- /dev/null
++++ b/src/app/modules/orders/contract.py
+@@ -0,0 +1,16 @@
++"""Public contract of the orders module. Other modules may import only this file."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from app.shared.events import Event
++
++
++@dataclass(frozen=True, slots=True)
++class ProductPurchased(Event):
++    order_id: str
++    user_id: str
++    product_id: str
++    quantity: int
++    total_cents: int
+diff --git a/src/app/modules/orders/domain.py b/src/app/modules/orders/domain.py
+new file mode 100644
+index 0000000..aa573de
+--- /dev/null
++++ b/src/app/modules/orders/domain.py
+@@ -0,0 +1,40 @@
++from __future__ import annotations
++
++import uuid
++from dataclasses import dataclass
++from datetime import UTC, datetime
++
++from app.shared import errors
++
++MAX_QUANTITY = 10
++
++
++@dataclass(slots=True)
++class Product:
++    id: str
++    name: str
++    price_cents: int
++    stock: int
++
++
++@dataclass(slots=True)
++class Order:
++    id: str
++    user_id: str
++    product_id: str
++    quantity: int
++    total_cents: int
++    created_at: datetime
++
++    @classmethod
++    def place(cls, user_id: str, product: Product, quantity: int) -> Order:
++        if not 1 <= quantity <= MAX_QUANTITY:
++            raise errors.ValidationFailed(f"quantity must be between 1 and {MAX_QUANTITY}")
++        return cls(
++            id=str(uuid.uuid4()),
++            user_id=user_id,
++            product_id=product.id,
++            quantity=quantity,
++            total_cents=product.price_cents * quantity,
++            created_at=datetime.now(UTC).replace(microsecond=0),
++        )
+diff --git a/src/app/modules/orders/infrastructure.py b/src/app/modules/orders/infrastructure.py
+new file mode 100644
+index 0000000..46ffb6a
+--- /dev/null
++++ b/src/app/modules/orders/infrastructure.py
+@@ -0,0 +1,66 @@
++from __future__ import annotations
++
++from datetime import UTC, datetime
++
++from app.modules.orders.domain import Order, Product
++from app.platform.ports.database import Row
++from app.repository import SqlRepository
++
++
++class ProductRepository(SqlRepository[Product]):
++    table = "products"
++
++    def to_row(self, entity: Product) -> Row:
++        return {
++            "id": entity.id,
++            "name": entity.name,
++            "price_cents": entity.price_cents,
++            "stock": entity.stock,
++        }
++
++    def from_row(self, row: Row) -> Product:
++        return Product(row["id"], row["name"], int(row["price_cents"]), int(row["stock"]))
++
++    def take_stock(self, product_id: str, quantity: int) -> int | None:
++        """Atomic decrement. Returns the new stock, or None if there was not enough.
++
++        The check and the write are one statement, so two concurrent buyers can
++        never oversell (no read-modify-write in Python).
++        """
++        rows = self.db.execute(
++            "UPDATE products SET stock = stock - :q WHERE id = :id AND stock >= :q RETURNING stock",
++            {"q": quantity, "id": product_id},
++        )
++        return int(rows[0]["stock"]) if rows else None
++
++
++class OrderRepository(SqlRepository[Order]):
++    table = "orders"
++
++    def to_row(self, entity: Order) -> Row:
++        return {
++            "id": entity.id,
++            "user_id": entity.user_id,
++            "product_id": entity.product_id,
++            "quantity": entity.quantity,
++            "total_cents": entity.total_cents,
++            "created_at": entity.created_at,
++        }
++
++    def from_row(self, row: Row) -> Order:
++        created = datetime.fromisoformat(str(row["created_at"])[:19]).replace(tzinfo=UTC)
++        return Order(
++            row["id"],
++            row["user_id"],
++            row["product_id"],
++            int(row["quantity"]),
++            int(row["total_cents"]),
++            created,
++        )
++
++    def for_user(self, user_id: str, limit: int = 50) -> list[Order]:
++        rows = self.db.execute(
++            "SELECT * FROM orders WHERE user_id = :u ORDER BY created_at DESC, id LIMIT :l",
++            {"u": user_id, "l": limit},
++        )
++        return [self.from_row(r) for r in rows]
+diff --git a/src/app/modules/orders/migrations/001_orders.sql b/src/app/modules/orders/migrations/001_orders.sql
+new file mode 100644
+index 0000000..c1df096
+--- /dev/null
++++ b/src/app/modules/orders/migrations/001_orders.sql
+@@ -0,0 +1,21 @@
++-- orders: product catalog and purchases. Stock can never go below zero.
++CREATE TABLE IF NOT EXISTS products (
++    id TEXT PRIMARY KEY,
++    name TEXT NOT NULL,
++    price_cents INTEGER NOT NULL CHECK (price_cents > 0),
++    stock INTEGER NOT NULL CHECK (stock >= 0)
++);
++CREATE TABLE IF NOT EXISTS orders (
++    id TEXT PRIMARY KEY,
++    user_id TEXT NOT NULL,
++    product_id TEXT NOT NULL REFERENCES products (id),
++    quantity INTEGER NOT NULL CHECK (quantity > 0),
++    total_cents INTEGER NOT NULL,
++    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
++);
++CREATE INDEX IF NOT EXISTS orders_user_id ON orders (user_id);
++INSERT INTO products (id, name, price_cents, stock) VALUES
++    ('sku-coffee', 'Coffee beans 1 kg', 8990, 50),
++    ('sku-mug', 'Ceramic mug', 3990, 10),
++    ('sku-grinder', 'Hand grinder', 24900, 2)
++ON CONFLICT (id) DO NOTHING;
+diff --git a/src/app/modules/orders/module.py b/src/app/modules/orders/module.py
+new file mode 100644
+index 0000000..d14a3a1
+--- /dev/null
++++ b/src/app/modules/orders/module.py
+@@ -0,0 +1,23 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++from fastapi import APIRouter
++
++from app.modules.base import ModuleSpec
++from app.modules.orders.api import build_router
++from app.modules.orders.application import OrderService
++from app.platform.facades import Platform
++
++
++def _router(platform: Platform) -> APIRouter:
++    service = OrderService(platform.database.sql, platform.storage, platform.events)
++    return build_router(service)
++
++
++MODULE = ModuleSpec(
++    name="orders",
++    summary="buy_product: catalog, purchase with atomic stock (SQL), receipt (S3), event",
++    build_router=_router,
++    migrations=Path(__file__).parent / "migrations",
++)
+diff --git a/strangler.yaml b/strangler.yaml
+index fc013e1..dfe341f 100644
+--- a/strangler.yaml
++++ b/strangler.yaml
+@@ -14,0 +15,6 @@ routes:
++  # buy_product is migrated; listing/reading old orders still lives in legacy.
++  # Longest prefix wins, so these two override /api/v1/orders above.
++  - prefix: /api/v1/orders/products
++    owner: modern
++  - prefix: /api/v1/orders/purchases
++    owner: modern
+diff --git a/tests/integration/test_orders_e2e.py b/tests/integration/test_orders_e2e.py
+new file mode 100644
+index 0000000..1b1810b
+--- /dev/null
++++ b/tests/integration/test_orders_e2e.py
+@@ -0,0 +1,42 @@
++"""buy_product through HTTP with every adapter on the AWS Emulator."""
++
++from __future__ import annotations
++
++import ssl
++import uuid
++
++import httpx
++from fastapi.testclient import TestClient
++
++from tests.credentials import PASSWORD
++
++
++def test_buy_product_on_the_emulator(api: TestClient) -> None:
++    email = f"buyer-{uuid.uuid4().hex[:8]}@example.com"
++    api.post("/api/v1/auth/register", json={"email": email, "password": PASSWORD, "name": "B"})
++    tokens = api.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD}).json()
++    h = {"authorization": f"Bearer {tokens['access_token']}"}
++
++    stock = {p["id"]: p["stock"] for p in api.get("/api/v1/orders/products", headers=h).json()}
++    r = api.post(
++        "/api/v1/orders/purchases", headers=h, json={"product_id": "sku-coffee", "quantity": 1}
++    )
++    assert r.status_code == 201, r.text
++    order = r.json()
++    after = {p["id"]: p["stock"] for p in api.get("/api/v1/orders/products", headers=h).json()}
++    assert after["sku-coffee"] == stock["sku-coffee"] - 1
++
++    too_many = api.post(
++        "/api/v1/orders/purchases",
++        headers=h,
++        json={"product_id": "sku-grinder", "quantity": stock["sku-grinder"] + 1},
++    )
++    assert too_many.status_code == 409
++
++    url = api.get(f"/api/v1/orders/purchases/{order['id']}/receipt", headers=h).json()["url"]
++    settings = api.app.state.settings  # type: ignore[attr-defined]
++    ca = ssl.create_default_context(
++        cafile=str(settings.emulator_home / str(settings.emulator_port) / "ca.pem")
++    )
++    receipt = httpx.get(url, verify=ca).json()
++    assert receipt["order_id"] == order["id"] and receipt["quantity"] == 1
+diff --git a/tests/unit/test_orders.py b/tests/unit/test_orders.py
+new file mode 100644
+index 0000000..d170f12
+--- /dev/null
++++ b/tests/unit/test_orders.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++from fastapi.testclient import TestClient
++
++from app.modules.orders.contract import ProductPurchased
++from app.platform.facades import Platform
++from app.strangler import Owner
++from tests.conftest import register_and_login
++
++
++def _stock(client: TestClient, headers: dict[str, str], sku: str) -> int:
++    products = client.get("/api/v1/orders/products", headers=headers).json()
++    return next(p["stock"] for p in products if p["id"] == sku)
++
++
++def test_buy_product(client: TestClient, platform: Platform) -> None:
++    seen: list[ProductPurchased] = []
++    platform.events.subscribe(ProductPurchased, seen.append)
++    headers = register_and_login(client)
++    before = _stock(client, headers, "sku-mug")
++
++    r = client.post(
++        "/api/v1/orders/purchases", headers=headers, json={"product_id": "sku-mug", "quantity": 3}
++    )
++
++    assert r.status_code == 201, r.text
++    order = r.json()
++    assert order["total_cents"] == 3 * 3990
++    assert _stock(client, headers, "sku-mug") == before - 3
++    assert [o["id"] for o in client.get("/api/v1/orders/purchases", headers=headers).json()] == [
++        order["id"]
++    ]
++    assert seen and seen[0].order_id == order["id"]
++    receipt = client.get(f"/api/v1/orders/purchases/{order['id']}/receipt", headers=headers)
++    assert receipt.status_code == 200
++
++
++def test_insufficient_stock_rolls_back(client: TestClient) -> None:
++    headers = register_and_login(client)
++    r = client.post(
++        "/api/v1/orders/purchases",
++        headers=headers,
++        json={"product_id": "sku-grinder", "quantity": 3},  # only 2 in stock
++    )
++    assert r.status_code == 409
++    assert r.json()["error"] == "conflict"
++    assert _stock(client, headers, "sku-grinder") == 2
++    assert client.get("/api/v1/orders/purchases", headers=headers).json() == []
++
++
++def test_unknown_product_and_bad_quantity(client: TestClient) -> None:
++    headers = register_and_login(client)
++    missing = client.post(
++        "/api/v1/orders/purchases", headers=headers, json={"product_id": "nope", "quantity": 1}
++    )
++    assert missing.status_code == 404
++    zero = client.post(
++        "/api/v1/orders/purchases", headers=headers, json={"product_id": "sku-mug", "quantity": 0}
++    )
++    assert zero.status_code == 422
++
++
++def test_requires_auth_and_hides_other_users_receipts(client: TestClient) -> None:
++    assert client.post("/api/v1/orders/purchases", json={}).status_code == 401
++    alice = register_and_login(client, "alice@example.com")
++    bob = register_and_login(client, "bob@example.com")
++    order = client.post(
++        "/api/v1/orders/purchases", headers=alice, json={"product_id": "sku-mug", "quantity": 1}
++    ).json()
++    url = f"/api/v1/orders/purchases/{order['id']}/receipt"
++    assert client.get(url, headers=bob).status_code == 404
++
++
++def test_strangler_routes_purchases_to_the_monolith(client: TestClient) -> None:
++    table = client.app.state.routes  # type: ignore[attr-defined]
++    assert table.owner_of("/api/v1/orders/purchases") is Owner.MODERN
++    assert table.owner_of("/api/v1/orders/products") is Owner.MODERN
++    assert table.owner_of("/api/v1/orders") is Owner.LEGACY  # old order history
++    assert table.owner_of("/api/v1/orders/o-1001") is Owner.LEGACY

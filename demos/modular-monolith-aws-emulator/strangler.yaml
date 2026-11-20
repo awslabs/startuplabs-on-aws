@@ -1,0 +1,14 @@
+# Strangler fig route table. Longest matching prefix wins.
+#   modern -> answered by this modular monolith
+#   legacy -> proxied to APP_LEGACY_BASE_URL (the system being replaced)
+# Migrating a capability = flipping its prefix from legacy to modern.
+default: modern
+routes:
+  - prefix: /api/v1/auth
+    owner: modern
+  - prefix: /api/v1/profiles
+    owner: modern
+  - prefix: /api/v1/jobs
+    owner: modern
+  - prefix: /api/v1/orders
+    owner: legacy
